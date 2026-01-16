@@ -12,6 +12,9 @@ from docx.oxml.ns import qn
 class DocxUtils:
     """DOCX转换通用工具类"""
     
+    # 全局缩放因子，默认1.0。由转换器根据DOCX内容区宽度设置为适配1200px。
+    SCALE = 1.0
+    
     # XML命名空间常量
     W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
     R_NS = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
@@ -29,7 +32,8 @@ class DocxUtils:
         EMU转像素
         1 EMU = 1/914400 英寸，96 DPI下 1英寸 = 96像素
         """
-        return int(emu_value * 96 / 914400) if emu_value else 0
+        base = int(emu_value * 96 / 914400) if emu_value else 0
+        return int(base * DocxUtils.SCALE)
     
     @staticmethod
     def emu_to_points(emu_value):
@@ -45,7 +49,8 @@ class DocxUtils:
         Twip转像素
         1 Twip = 1/20 磅，1磅 ≈ 1.33像素
         """
-        return twip_value / 20 * 1.33 if twip_value else 0
+        base = twip_value / 20 * 1.33 if twip_value else 0
+        return base * DocxUtils.SCALE
     
     @staticmethod
     def twip_to_points(twip_value):
@@ -234,7 +239,7 @@ class DocxUtils:
             sz_val = sz.get(qn('w:val'))
             if sz_val:
                 font_size_pt = int(sz_val) / 2
-                font_size_px = int(font_size_pt * 1.33)
+                font_size_px = int(font_size_pt * 1.33 * DocxUtils.SCALE)
                 styles.append(f'font-size: {font_size_px}px')
         
         # 颜色
@@ -268,16 +273,10 @@ class DocxUtils:
         b = rPr.find(qn('w:b'))
         if b is not None and b.get(qn('w:val')) != '0':
             styles.append('font-weight: bold')
-        bCs = rPr.find(qn('w:bCs'))
-        if bCs is not None and bCs.get(qn('w:val')) != '0':
-            styles.append('font-weight: bold')
         
         # 斜体
         i = rPr.find(qn('w:i'))
         if i is not None and i.get(qn('w:val')) != '0':
-            styles.append('font-style: italic')
-        iCs = rPr.find(qn('w:iCs'))
-        if iCs is not None and iCs.get(qn('w:val')) != '0':
             styles.append('font-style: italic')
         
         # 下划线
@@ -321,7 +320,7 @@ class DocxUtils:
             spacing_val = spacing.get(qn('w:val'))
             if spacing_val:
                 spacing_twip = int(spacing_val)
-                spacing_px = int(spacing_twip / 20 * 1.33)
+                spacing_px = int(spacing_twip / 20 * 1.33 * DocxUtils.SCALE)
                 styles.append(f'letter-spacing: {spacing_px}px')
         
         # 字符缩放

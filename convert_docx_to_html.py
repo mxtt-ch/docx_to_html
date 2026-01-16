@@ -84,6 +84,40 @@ class DocxToHTMLConverter:
         self._load_numbering_definitions()
         self._load_table_styles()
 
+        # 初始化缩放因子，使内容区宽度映射到1200px
+        try:
+            self._init_scale_to_1200()
+        except Exception as e:
+            self.log_file.write(f"初始化缩放因子失败，使用1.0: {e}\n")
+            DocxUtils.SCALE = 1.0
+
+    def _init_scale_to_1200(self):
+        """计算DOCX内容区宽度并设置全局缩放因子到1200px"""
+        def emu_to_px_no_scale(emu):
+            return int(emu * 96 / 914400) if emu else 0
+        try:
+            section = self.doc.sections[0]
+            page_w = getattr(section, 'page_width', None)
+            left_m = getattr(section, 'left_margin', None)
+            right_m = getattr(section, 'right_margin', None)
+            content_emu = int(page_w) - int(left_m) - int(right_m) if page_w and left_m is not None and right_m is not None else None
+            if content_emu and content_emu > 0:
+                content_px = emu_to_px_no_scale(int(content_emu))
+                scale = 1200 / content_px if content_px > 0 else 1.0
+                # 限制缩放范围避免异常
+                if scale < 0.5:
+                    scale = 0.5
+                if scale > 2.5:
+                    scale = 2.5
+                DocxUtils.SCALE = scale
+                self.log_file.write(f"内容区宽度: {content_px}px -> 目标1200px, SCALE={scale:.4f}\n")
+            else:
+                DocxUtils.SCALE = 1.0
+                self.log_file.write("无法获取内容区宽度，SCALE=1.0\n")
+        except Exception as e:
+            DocxUtils.SCALE = 1.0
+            self.log_file.write(f"缩放计算异常，SCALE=1.0: {e}\n")
+
     def _load_all_resources(self):
         """加载docx包中的所有资源文件（仅XML文件，不包括图片）"""
         self.log_file.write(f"\n{'='*80}\n")
@@ -736,7 +770,6 @@ class DocxToHTMLConverter:
     
     def _process_run_elements(self, run_element, text_buffer, is_hyperlink, style, html_parts):
         """处理run内的所有元素，区分文本和格式元素"""
-        pending_text_elems = []
         for child in run_element:
             # 文本元素
             if child.tag == DocxUtils.W_NS + 't':
@@ -820,48 +853,6 @@ class DocxToHTMLConverter:
             # 字段分隔符 - 忽略
             elif child.tag == DocxUtils.W_NS + 'fldChar':
                 pass
-            # 图片/文本框 - 内联渲染
-            elif child.tag == DocxUtils.W_NS + 'drawing':
-                # 先输出缓冲区中的文本
-                if text_buffer:
-                    combined_text = ''.join(text_buffer)
-                    if combined_text.strip():
-                        if is_hyperlink:
-                            self._process_hyperlink(None, combined_text, style, html_parts)
-                        else:
-                            escaped_text = escape(combined_text)
-                            html_parts.append(f'<span style="{style}">{escaped_text}</span>')
-                    text_buffer.clear()
-                # 处理图片
-                blip = child.find(f'.//{DocxUtils.A_NS}blip')
-                if blip is not None:
-                    r_embed = blip.get(f'{DocxUtils.R_NS}embed')
-                    if r_embed:
-                        try:
-                            self.image_counter += 1
-                            filename, width, height = self.extract_image_with_textbox(r_embed, child, self.image_counter, extra_text_elems=pending_text_elems)
-                            pending_text_elems = []
-                            if filename:
-                                wrap_style = self._get_image_wrap_style(child)
-                                img_style = []
-                                if width:
-                                    img_style.append(f'width:{int(width)}px')
-                                if height:
-                                    img_style.append(f'height:{int(height)}px')
-                                if wrap_style:
-                                    img_style.append(wrap_style)
-                                # 保持行内与文本对齐
-                                img_style.append('vertical-align:middle')
-                                src = escape(os.path.join('images', filename).replace('\\', '/'))
-                                html_parts.append(f'<img src="{src}" style="{"; ".join(img_style)}">')
-                        except Exception:
-                            pass
-                else:
-                    # 如果是独立文本框内容
-                    txbx = child.find(f'.//{DocxUtils.W_NS}txbxContent')
-                    if txbx is not None:
-                        # 将文本框元素暂存，等下一张图片时合并到图片上
-                        pending_text_elems.append(child)
     
     def _process_hyperlink(self, hyperlink_elem, text, style, html_parts):
         """处理超链接"""
@@ -1261,9 +1252,9 @@ class DocxToHTMLConverter:
         
         return None
     
-    def extract_image_with_textbox(self, r_embed, drawing_elem, image_index, extra_text_elems=None):
+    def extract_image_with_textbox(self, r_embed, drawing_elem, image_index):
         """
-        提取图片并合并文本框标注（按需处理模式）
+        提取图片及其显示尺寸，并解析叠加的文本框位置（不再进行合成）
         
         Args:
             r_embed: 图片关系ID
@@ -1271,7 +1262,7 @@ class DocxToHTMLConverter:
             image_index: 图片索引
             
         Returns:
-            tuple: (filename, width, height)
+            dict: {filename, width, height, overlays: [{'text': str, 'x': px, 'y': px, 'width': px|None, 'height': px|None}]}
         """
         try:
             image_part = None
@@ -1317,30 +1308,6 @@ class DocxToHTMLConverter:
             textboxes, positions = self.extract_textbox_from_drawing(
                 drawing_elem, original_width, original_height
             )
-            
-            # 合并额外的文本框（来自同段落的独立标注）
-            if extra_text_elems:
-                for tx_elem in extra_text_elems:
-                    try:
-                        tx_textboxes, _ = self.extract_textbox_from_drawing(
-                            tx_elem, original_width, original_height
-                        )
-                        if tx_textboxes:
-                            # 使用各自元素计算位置
-                            pos = self._get_textbox_position(tx_elem, original_width, original_height, drawing_elem=None)
-                            color_info = self._get_textbox_colors(tx_elem)
-                            pos.update(color_info)
-                            for tb in tx_textboxes:
-                                textboxes.append(tb)
-                                positions.append(pos)
-                    except Exception:
-                        continue
-            
-            if textboxes and positions:
-                img = self._composite_textboxes_to_image(
-                    img, textboxes, positions, original_width, original_height
-                )
-            
             filename = f"image_{image_index}.png"
             save_path = os.path.join(self.images_dir, filename)
             try:
@@ -1350,12 +1317,28 @@ class DocxToHTMLConverter:
                 save_path = os.path.join(self.images_dir, filename)
                 img.convert("RGB").save(save_path, quality=90)
             
-            return filename, display_width, display_height
+            overlays = []
+            if textboxes and positions:
+                for tb, pos in zip(textboxes, positions):
+                    text = ' '.join(tb).strip()
+                    overlays.append({
+                        'text': text,
+                        'x': int(pos.get('x', 0)),
+                        'y': int(pos.get('y', 0)),
+                        'width': int(pos.get('width')) if pos.get('width') else None,
+                        'height': int(pos.get('height')) if pos.get('height') else None
+                    })
+            return {
+                'filename': filename,
+                'width': display_width,
+                'height': display_height,
+                'overlays': overlays
+            }
         except Exception as e:
             self.log_file.write(f"      提取图片失败: {e}\n")
             import traceback
             self.log_file.write(f"      异常详情: {traceback.format_exc()}\n")
-            return None, None, None
+            return None
     
     def _get_image_display_size(self, drawing_elem, original_width, original_height):
         """
@@ -1460,7 +1443,7 @@ class DocxToHTMLConverter:
         positions = []
         
         try:
-            self.log_file.write(f"    开始提取文本框： 图片尺寸: {img_width}x{img_height}\n")
+            self.log_file.write(f"    开始提取文本框... 图片尺寸: {img_width}x{img_height}\n")
             
             # 方法1: 查找drawing元素内的所有嵌套结构，包括文本框
             # 先查找inline或anchor内的文本框
@@ -1492,8 +1475,6 @@ class DocxToHTMLConverter:
                         textboxes.append([combined_text])
                         # 获取文本框位置
                         position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
-                        color_info = self._get_textbox_colors(drawing_elem)
-                        position.update(color_info)
                         positions.append(position)
                         self.log_file.write(f"    提取文本框文本: '{combined_text[:50]}...', 位置: {position}\n")
                 
@@ -1522,8 +1503,6 @@ class DocxToHTMLConverter:
                         if combined_text.strip():
                             textboxes.append([combined_text])
                             position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
-                            color_info = self._get_textbox_colors(drawing_elem)
-                            position.update(color_info)
                             positions.append(position)
                             self.log_file.write(f"    提取文本框文本: '{combined_text[:50]}...', 位置: {position}\n")
                 
@@ -1539,8 +1518,6 @@ class DocxToHTMLConverter:
                         else:
                             textboxes.append([text_content.strip()])
                             position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
-                            color_info = self._get_textbox_colors(drawing_elem)
-                            position.update(color_info)
                             positions.append(position)
                             self.log_file.write(f"    提取docPr文本: '{text_content}', 位置: {position}\n")
                 
@@ -1557,8 +1534,6 @@ class DocxToHTMLConverter:
                             # 可能是独立标注
                             textboxes.append([text_content])
                             position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
-                            color_info = self._get_textbox_colors(drawing_elem)
-                            position.update(color_info)
                             positions.append(position)
                             self.log_file.write(f"    提取DrawingML文本: '{text_content}', 位置: {position}\n")
         
@@ -1584,38 +1559,6 @@ class DocxToHTMLConverter:
             else:
                 break
         return None
-    
-    def _hex_to_rgba(self, hex_str, alpha=255):
-        try:
-            if hex_str and len(hex_str) == 6:
-                r = int(hex_str[0:2], 16)
-                g = int(hex_str[2:4], 16)
-                b = int(hex_str[4:6], 16)
-                return (r, g, b, alpha)
-        except Exception:
-            pass
-        return (255, 0, 0, alpha)
-    
-    def _get_textbox_colors(self, textbox_elem):
-        colors = {'text_color': (255, 0, 0, 255), 'border_color': (255, 0, 0, 255), 'bg_color': (255, 255, 255, 200)}
-        try:
-            for elem in textbox_elem.iter():
-                if elem.tag == DocxUtils.A_NS + 'solidFill':
-                    srgb = elem.find(f'.//{DocxUtils.A_NS}srgbClr')
-                    if srgb is not None:
-                        val = srgb.get('val')
-                        if val:
-                            rgba = self._hex_to_rgba(val, 255)
-                            colors['text_color'] = rgba
-                if elem.tag == DocxUtils.A_NS + 'ln':
-                    srgb = elem.find(f'.//{DocxUtils.A_NS}srgbClr')
-                    if srgb is not None:
-                        val = srgb.get('val')
-                        if val:
-                            colors['border_color'] = self._hex_to_rgba(val, 255)
-        except Exception:
-            pass
-        return colors
     
     def _get_textbox_position(self, textbox_elem, img_width, img_height, drawing_elem=None):
         """
@@ -1848,8 +1791,8 @@ class DocxToHTMLConverter:
                     bg_y2 = min(img_height, y + text_height + padding)
                     
                     # 绘制半透明背景
-                    bg_color = pos.get('bg_color', (255, 255, 255, 220))
-                    border_color = pos.get('border_color', (255, 0, 0, 255))
+                    bg_color = (255, 255, 255, 220)  # 半透明白色
+                    border_color = (0, 0, 0, 255)    # 不透明黑色
                     
                     # 绘制背景
                     draw.rectangle(
@@ -1862,8 +1805,7 @@ class DocxToHTMLConverter:
                     draw.text((x + 2, y + 2), text, fill=shadow_color, font=font)
                     
                     # 绘制文本
-                    text_color = pos.get('text_color', (255, 0, 0, 255))
-                    draw.text((x, y), text, fill=text_color, font=font)
+                    draw.text((x, y), text, fill=(0, 0, 0, 255), font=font)
                     
                     self.log_file.write(f"      背景矩形: {bg_x1},{bg_y1} -> {bg_x2},{bg_y2}\n")
             
@@ -1898,6 +1840,10 @@ class DocxToHTMLConverter:
             
             html += f'<div style="{container_style}">'
             
+            # 预先提取段落文本内容，便于决定图片的混排位置
+            text_content = self.extract_paragraph_text_with_links(paragraph)
+            has_text_content = bool(text_content and text_content.strip())
+            
             # 处理图片
             for i, img in enumerate(images):
                 if img.get('type') == 'textbox':
@@ -1913,22 +1859,61 @@ class DocxToHTMLConverter:
                         img_style.append(f'width: {int(img["width"])}px')
                     if img['height']:
                         img_style.append(f'height: {int(img["height"])}px')
+                    has_textbox = any(x.get('type') == 'textbox' for x in images)
                     if img.get('wrap_style'):
-                        img_style.append(img['wrap_style'])
+                        # 若存在文本框且wrap为左浮动，则改为右浮动以匹配混排布局
+                        if has_textbox and img['wrap_style'] == 'float: left':
+                            img_style.append('float: right')
+                        else:
+                            # 若存在段落文本且图片较小，优先将图片置于右侧形成图文混排
+                            if has_text_content and img['wrap_style'] == 'float: left' and img.get('width') and img['width'] <= 400:
+                                img_style.append('float: right')
+                            else:
+                                img_style.append(img['wrap_style'])
+                    else:
+                        # 如果同段存在文本框而未给定wrap，优先让图片靠右以实现混排
+                        if has_textbox:
+                            img_style.append('float: right')
+                        # 如果无文本框，但段落存在文本内容，优先将图片靠右以便文字在左侧
+                        elif has_text_content:
+                            img_style.append('float: right')
                     
                     # 保持仅基于XML的尺寸，不添加静态样式
                     
-                    img_style_str = '; '.join(img_style)
-                    
-                    # 确保图片路径正确
-                    img_path = f"./images/{img['filename']}"
-                    self.log_file.write(f"  生成图片标签: src={img_path}, style={img_style_str}\n")
-                    
-                    html += f'<img src="{img_path}" style="{img_style_str}" alt="{img["filename"]}" />'
+                    # 若存在叠加文本框，使用定位容器实现覆盖显示
+                    if img.get('overlays'):
+                        container_styles = []
+                        if img.get('width'):
+                            container_styles.append(f'width: {int(img["width"])}px')
+                        if img.get('height'):
+                            container_styles.append(f'height: {int(img["height"])}px')
+                        container_styles.append('position: relative')
+                        container_str = '; '.join(container_styles)
+                        img_style_str = '; '.join(img_style)
+                        img_path = f"./images/{img['filename']}"
+                        html += f'<div style="{container_str}">'
+                        html += f'<img src="{img_path}" style="{img_style_str}" alt="{img["filename"]}" />'
+                        # 叠加层
+                        for ov in img['overlays']:
+                            ov_styles = ['position: absolute']
+                            ov_styles.append(f'left: {int(ov["x"])}px')
+                            ov_styles.append(f'top: {int(ov["y"])}px')
+                            if ov.get('width'):
+                                ov_styles.append(f'width: {int(ov["width"])}px')
+                            if ov.get('height'):
+                                ov_styles.append(f'height: {int(ov["height"])}px')
+                            ov_style_str = '; '.join(ov_styles)
+                            escaped_text = escape(ov.get('text', ''))
+                            html += f'<div style="{ov_style_str}">{escaped_text}</div>'
+                        html += '</div>'
+                    else:
+                        img_style_str = '; '.join(img_style)
+                        img_path = f"./images/{img['filename']}"
+                        self.log_file.write(f"  生成图片标签: src={img_path}, style={img_style_str}\n")
+                        html += f'<img src="{img_path}" style="{img_style_str}" alt="{img["filename"]}" />'
             
             # 添加段落文本（如果有）
-            text_content = self.extract_paragraph_text_with_links(paragraph)
-            if text_content and text_content.strip():
+            if has_text_content:
                 html += f'<div>{text_content}</div>'
             
             html += '</div>'
@@ -2235,7 +2220,7 @@ class DocxToHTMLConverter:
     def extract_images_from_paragraph(self, paragraph):
         """从段落中提取图片"""
         images = []
-        self.log_file.write(f"  开始从段落中提取图片: {paragraph.text[:50]}\n")
+        self.log_file.write(f"  开始从段落中提取图片: {paragraph.text[:50]}...\n")
         
         for run_idx, run in enumerate(paragraph.runs):
             drawing_elements = run._element.findall(f'.//{DocxUtils.W_NS}drawing')
@@ -2277,20 +2262,21 @@ class DocxToHTMLConverter:
 
                             self.image_counter += 1
 
-                            # 提取图片并合并文本框，同时获取图片实际尺寸
-                            filename, img_width, img_height = self.extract_image_with_textbox(
+                            # 提取图片与文本框位置信息
+                            image_info = self.extract_image_with_textbox(
                                 r_embed, drawing, self.image_counter
                             )
 
-                            if filename:
-                                self.log_file.write(f"        成功提取图片: {filename}, 尺寸: {img_width}x{img_height}\n")
+                            if image_info and image_info.get('filename'):
+                                self.log_file.write(f"        成功提取图片: {image_info['filename']}, 尺寸: {image_info['width']}x{image_info['height']}\n")
                                 wrap_style = self._get_image_wrap_style(drawing)
                                 images.append({
                                     'type': 'image',
-                                    'filename': filename,
-                                    'width': int(img_width) if img_width else None,
-                                    'height': int(img_height) if img_height else None,
-                                    'wrap_style': wrap_style
+                                    'filename': image_info['filename'],
+                                    'width': int(image_info['width']) if image_info.get('width') else None,
+                                    'height': int(image_info['height']) if image_info.get('height') else None,
+                                    'wrap_style': wrap_style,
+                                    'overlays': image_info.get('overlays', [])
                                 })
                             else:
                                 self.log_file.write(f"        提取图片失败: {r_embed}\n")
@@ -2585,7 +2571,13 @@ class DocxToHTMLConverter:
         try:
             anchor = drawing_elem.find(f'.//{DocxUtils.WP_NS}anchor')
             if anchor is not None:
-                wrap_left = anchor.find(f'.//{DocxUtils.WP_NS}wrapSquare') or anchor.find(f'.//{DocxUtils.WP_NS}wrapTight') or anchor.find(f'.//{DocxUtils.WP_NS}wrapNone') or anchor.find(f'.//{DocxUtils.WP_NS}wrapTopBottom')
+                wrap_left = anchor.find(f'.//{DocxUtils.WP_NS}wrapSquare')
+                if wrap_left is None:
+                    wrap_left = anchor.find(f'.//{DocxUtils.WP_NS}wrapTight')
+                if wrap_left is None:
+                    wrap_left = anchor.find(f'.//{DocxUtils.WP_NS}wrapNone')
+                if wrap_left is None:
+                    wrap_left = anchor.find(f'.//{DocxUtils.WP_NS}wrapTopBottom')
                 positionH = anchor.find(f'.//{DocxUtils.WP_NS}positionH')
                 if positionH is not None:
                     align = positionH.find(f'.//{DocxUtils.WP_NS}align')
@@ -2594,6 +2586,19 @@ class DocxToHTMLConverter:
                             return 'float: left'
                         elif align.text == 'right':
                             return 'float: right'
+                    # 未提供align时，依据posOffset进行推断
+                    posOffset = positionH.find(f'.//{DocxUtils.WP_NS}posOffset')
+                    if posOffset is not None and posOffset.text:
+                        try:
+                            offset_px = DocxUtils.emu_to_pixels(int(posOffset.text))
+                            # 依据页面宽度的一半作为分界线进行左右推断
+                            page_width_px = 1200
+                            if offset_px >= page_width_px // 2:
+                                return 'float: right'
+                            else:
+                                return 'float: left'
+                        except Exception:
+                            pass
                 # 如果没有align，根据wrap类型返回可用的默认
                 if wrap_left is not None:
                     return None
