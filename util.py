@@ -14,7 +14,7 @@ class DocxUtils:
     
     # 全局缩放因子，默认1.0。由转换器根据DOCX内容区宽度设置为适配1200px。
     SCALE = 1.0
-    
+
     # XML命名空间常量
     W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
     R_NS = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
@@ -24,16 +24,24 @@ class DocxUtils:
     V_NS = '{urn:schemas-microsoft-com:vml}'
     W14_NS = '{http://schemas.microsoft.com/office/word/2010/wordml}'
     W15_NS = '{http://schemas.microsoft.com/office/word/2012/wordml}'
+    WPS_NS = '{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}'
     MC_NS = '{http://schemas.openxmlformats.org/markup-compatibility/2006}'
     
     @staticmethod
-    def emu_to_pixels(emu_value):
+    def emu_to_pixels(emu_value, apply_scale=False):
         """
         EMU转像素
         1 EMU = 1/914400 英寸，96 DPI下 1英寸 = 96像素
+        
+        Args:
+            emu_value: EMU值
+            apply_scale: 是否应用全局缩放因子，默认为False
         """
         base = int(emu_value * 96 / 914400) if emu_value else 0
-        return int(base * DocxUtils.SCALE)
+        if apply_scale:
+            return int(base * DocxUtils.SCALE)
+        else:
+            return base
     
     @staticmethod
     def emu_to_points(emu_value):
@@ -44,13 +52,20 @@ class DocxUtils:
         return emu_value * 72 / 914400 if emu_value else 0
     
     @staticmethod
-    def twip_to_pixels(twip_value):
+    def twip_to_pixels(twip_value, apply_scale=False):
         """
         Twip转像素
         1 Twip = 1/20 磅，1磅 ≈ 1.33像素
+        
+        Args:
+            twip_value: Twip值
+            apply_scale: 是否应用全局缩放因子，默认为False
         """
         base = twip_value / 20 * 1.33 if twip_value else 0
-        return base * DocxUtils.SCALE
+        if apply_scale:
+            return base * DocxUtils.SCALE
+        else:
+            return base
     
     @staticmethod
     def twip_to_points(twip_value):
@@ -136,7 +151,7 @@ class DocxUtils:
         return '; '.join([f"{k}: {v}" for k, v in css_dict.items()])
     
     @staticmethod
-    def get_paragraph_style_css(pPr, log_file=None):
+    def get_paragraph_style_css(pPr, log_file=None, apply_scale=False):
         """从段落属性XML生成CSS样式（完整版）"""
         styles = []
 
@@ -157,13 +172,13 @@ class DocxUtils:
             # 段前间距
             before = spacing.get(qn('w:before'))
             if before:
-                before_px = int(DocxUtils.twip_to_pixels(int(before)))
+                before_px = int(DocxUtils.twip_to_pixels(int(before), apply_scale=apply_scale))
                 styles.append(f'margin-top: {before_px}px')
 
             # 段后间距
             after = spacing.get(qn('w:after'))
             if after:
-                after_px = int(DocxUtils.twip_to_pixels(int(after)))
+                after_px = int(DocxUtils.twip_to_pixels(int(after), apply_scale=apply_scale))
                 styles.append(f'margin-bottom: {after_px}px')
 
             # 行间距
@@ -186,25 +201,25 @@ class DocxUtils:
             # 左缩进
             left = ind.get(qn('w:left'))
             if left:
-                left_px = int(DocxUtils.twip_to_pixels(int(left)))
+                left_px = int(DocxUtils.twip_to_pixels(int(left), apply_scale=apply_scale))
                 styles.append(f'margin-left: {left_px}px')
 
             # 右缩进
             right = ind.get(qn('w:right'))
             if right:
-                right_px = int(DocxUtils.twip_to_pixels(int(right)))
+                right_px = int(DocxUtils.twip_to_pixels(int(right), apply_scale=apply_scale))
                 styles.append(f'margin-right: {right_px}px')
 
             # 首行缩进
             first_line = ind.get(qn('w:firstLine'))
             if first_line:
-                first_line_px = int(DocxUtils.twip_to_pixels(int(first_line)))
+                first_line_px = int(DocxUtils.twip_to_pixels(int(first_line), apply_scale=apply_scale))
                 styles.append(f'text-indent: {first_line_px}px')
 
             # 悬挂缩进（负值）
             hanging = ind.get(qn('w:hanging'))
             if hanging:
-                hanging_px = int(DocxUtils.twip_to_pixels(int(hanging)))
+                hanging_px = int(DocxUtils.twip_to_pixels(int(hanging), apply_scale=apply_scale))
                 styles.append(f'text-indent: -{hanging_px}px')
 
         # 首字下沉（w:indFirstLineChars）
@@ -226,7 +241,7 @@ class DocxUtils:
         return DocxUtils.normalize_css('; '.join(styles))
     
     @staticmethod
-    def get_run_style_css(rPr):
+    def get_run_style_css(rPr, apply_scale=False):
         """从run属性XML生成CSS样式（完整版）"""
         styles = []
         
@@ -239,7 +254,8 @@ class DocxUtils:
             sz_val = sz.get(qn('w:val'))
             if sz_val:
                 font_size_pt = int(sz_val) / 2
-                font_size_px = int(font_size_pt * 1.33 * DocxUtils.SCALE)
+                base_px = font_size_pt * 1.33
+                font_size_px = int(base_px * (DocxUtils.SCALE if apply_scale else 1.0))
                 styles.append(f'font-size: {font_size_px}px')
         
         # 颜色
@@ -320,7 +336,7 @@ class DocxUtils:
             spacing_val = spacing.get(qn('w:val'))
             if spacing_val:
                 spacing_twip = int(spacing_val)
-                spacing_px = int(spacing_twip / 20 * 1.33 * DocxUtils.SCALE)
+                spacing_px = int(DocxUtils.twip_to_pixels(spacing_twip, apply_scale=apply_scale))
                 styles.append(f'letter-spacing: {spacing_px}px')
         
         # 字符缩放

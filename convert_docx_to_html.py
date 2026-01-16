@@ -369,11 +369,11 @@ class DocxToHTMLConverter:
             if ancestor_style_id in self.style_definitions:
                 style_def = self.style_definitions[ancestor_style_id]
                 if property_type == 'paragraph' and style_def['pPr']:
-                    css = DocxUtils.get_paragraph_style_css(style_def['pPr'], self.log_file)
+                    css = DocxUtils.get_paragraph_style_css(style_def['pPr'], self.log_file, apply_scale=False)
                     if css:
                         css_parts.append(css)
                 elif property_type == 'run' and style_def['rPr']:
-                    css = DocxUtils.get_run_style_css(style_def['rPr'])
+                    css = DocxUtils.get_run_style_css(style_def['rPr'], apply_scale=False)
                     if css:
                         css_parts.append(css)
         
@@ -911,7 +911,7 @@ class DocxToHTMLConverter:
         
         # 获取run上的直接格式（优先级最高）
         if rPr is not None:
-            direct_css = DocxUtils.get_run_style_css(rPr)
+            direct_css = DocxUtils.get_run_style_css(rPr, apply_scale=False)
             if direct_css:
                 css_parts.append(direct_css)
         
@@ -944,7 +944,7 @@ class DocxToHTMLConverter:
         
         # 获取段落上的直接格式（优先级最高）
         if pPr is not None:
-            direct_css = DocxUtils.get_paragraph_style_css(pPr, self.log_file)
+            direct_css = DocxUtils.get_paragraph_style_css(pPr, self.log_file, apply_scale=False)
             if direct_css:
                 css_parts.append(direct_css)
         
@@ -1306,7 +1306,7 @@ class DocxToHTMLConverter:
             )
             
             textboxes, positions = self.extract_textbox_from_drawing(
-                drawing_elem, original_width, original_height
+                drawing_elem, display_width, display_height
             )
             filename = f"image_{image_index}.png"
             save_path = os.path.join(self.images_dir, filename)
@@ -1320,14 +1320,78 @@ class DocxToHTMLConverter:
             overlays = []
             if textboxes and positions:
                 for tb, pos in zip(textboxes, positions):
-                    text = ' '.join(tb).strip()
-                    overlays.append({
-                        'text': text,
+                    overlay = {
+                        'type': 'text',
+                        'html': tb.get('html', ''),
                         'x': int(pos.get('x', 0)),
                         'y': int(pos.get('y', 0)),
                         'width': int(pos.get('width')) if pos.get('width') else None,
                         'height': int(pos.get('height')) if pos.get('height') else None
-                    })
+                    }
+                    if tb.get('border_css'):
+                        overlay['border_css'] = tb.get('border_css')
+                    elif hasattr(self, '_get_shape_border_css'):
+                        # 兼容旧代码，如果有定义该方法
+                         border_css = self._get_shape_border_css(tb.get('elem'))
+                         if border_css:
+                            overlay['border_css'] = border_css
+                    overlays.append(overlay)
+            
+            # 提取同一drawing中的其他图片作为叠加层（相对于主图片定位）
+            try:
+                original_img_width, original_img_height = self._get_original_image_size(drawing_elem)
+                scale_x = display_width / original_img_width if original_img_width > 0 else 1
+                scale_y = display_height / original_img_height if original_img_height > 0 else 1
+                overlay_index = 0
+                for elem in drawing_elem.iter():
+                    if elem.tag == DocxUtils.PIC_NS + 'pic':
+                        blip = elem.find(f'.//{DocxUtils.A_NS}blip')
+                        if blip is None:
+                            continue
+                        o_embed = blip.get(f'{DocxUtils.R_NS}embed')
+                        if not o_embed or o_embed == r_embed:
+                            continue
+                        overlay_part = None
+                        for rel in self.doc.part.rels.values():
+                            if rel.rId == o_embed:
+                                overlay_part = rel.target_part
+                                break
+                        if overlay_part is None:
+                            continue
+                        overlay_bytes = overlay_part.blob
+                        try:
+                            oimg = PILImage.open(BytesIO(overlay_bytes))
+                        except Exception:
+                            continue
+                        # 读取位置与大小（未缩放）
+                        pos_info = self._get_textbox_position(elem, display_width, display_height, drawing_elem)
+                        ox = int(pos_info.get('x', 0))
+                        oy = int(pos_info.get('y', 0))
+                        owidth = int(pos_info.get('width')) if pos_info.get('width') else None
+                        oheight = int(pos_info.get('height')) if pos_info.get('height') else None
+                        # 保存叠加图片
+                        overlay_index += 1
+                        ofilename = f"image_{image_index}_overlay_{overlay_index}.png"
+                        os_path = os.path.join(self.images_dir, ofilename)
+                        try:
+                            oimg.save(os_path)
+                        except Exception:
+                            ofilename = f"image_{image_index}_overlay_{overlay_index}.jpg"
+                            os_path = os.path.join(self.images_dir, ofilename)
+                            try:
+                                oimg.convert("RGB").save(os_path, quality=90)
+                            except Exception:
+                                continue
+                        overlays.append({
+                            'type': 'image',
+                            'filename': ofilename,
+                            'x': ox,
+                            'y': oy,
+                            'width': owidth,
+                            'height': oheight
+                        })
+            except Exception as e:
+                self.log_file.write(f"      提取叠加图片失败: {e}\n")
             return {
                 'filename': filename,
                 'width': display_width,
@@ -1360,11 +1424,11 @@ class DocxToHTMLConverter:
                 cy = extent.get('cy')
                 
                 if cx and cy:
-                    # EMU转像素
+                    # EMU转像素（图片需要随内容区缩放）
                     width_emu = int(cx)
                     height_emu = int(cy)
-                    display_width = DocxUtils.emu_to_pixels(width_emu)
-                    display_height = DocxUtils.emu_to_pixels(height_emu)
+                    display_width = DocxUtils.emu_to_pixels(width_emu, apply_scale=True)
+                    display_height = DocxUtils.emu_to_pixels(height_emu, apply_scale=True)
                     self.log_file.write(f"      从extent获取显示尺寸: {display_width}x{display_height}\n")
                     return display_width, display_height
             
@@ -1376,8 +1440,8 @@ class DocxToHTMLConverter:
                     if cx and cy:
                         width_emu = int(cx)
                         height_emu = int(cy)
-                        display_width = DocxUtils.emu_to_pixels(width_emu)
-                        display_height = DocxUtils.emu_to_pixels(height_emu)
+                        display_width = DocxUtils.emu_to_pixels(width_emu, apply_scale=True)
+                        display_height = DocxUtils.emu_to_pixels(height_emu, apply_scale=True)
                         self.log_file.write(f"      从a:ext获取显示尺寸: {display_width}x{display_height}\n")
                         return display_width, display_height
             
@@ -1402,6 +1466,48 @@ class DocxToHTMLConverter:
         except:
             pass
         return 0
+    
+    def _get_original_image_size(self, drawing_elem):
+        """
+        获取图片的原始尺寸（未应用缩放的EMU值对应的像素尺寸）
+        
+        Args:
+            drawing_elem: drawing元素
+            
+        Returns:
+            tuple: (original_width, original_height) 原始像素尺寸
+        """
+        try:
+            # 查找extent元素（wp:extent）
+            extent = drawing_elem.find(f'.//{DocxUtils.WP_NS}extent')
+            if extent is not None:
+                cx = extent.get('cx')
+                cy = extent.get('cy')
+                
+                if cx and cy:
+                    # EMU转像素（不应用缩放）
+                    width_emu = int(cx)
+                    height_emu = int(cy)
+                    original_width = DocxUtils.emu_to_pixels(width_emu, apply_scale=False)
+                    original_height = DocxUtils.emu_to_pixels(height_emu, apply_scale=False)
+                    return original_width, original_height
+            
+            # 如果没有extent，尝试从a:ext获取（DrawingML）
+            for elem in drawing_elem.iter():
+                if elem.tag == DocxUtils.A_NS + 'ext':
+                    cx = elem.get('cx')
+                    cy = elem.get('cy')
+                    if cx and cy:
+                        width_emu = int(cx)
+                        height_emu = int(cy)
+                        original_width = DocxUtils.emu_to_pixels(width_emu, apply_scale=False)
+                        original_height = DocxUtils.emu_to_pixels(height_emu, apply_scale=False)
+                        return original_width, original_height
+            
+            # 如果都没有，返回默认尺寸
+            return 800, 600
+        except Exception:
+            return 800, 600
     
     def _get_image_crop(self, drawing_elem):
         """获取图片裁剪区域"""
@@ -1451,60 +1557,30 @@ class DocxToHTMLConverter:
                 # 查找w:txbxContent（文本框内容）
                 if elem.tag == DocxUtils.W_NS + 'txbxContent':
                     self.log_file.write(f"      找到txbxContent元素\n")
-                    text_parts = []
-                    
-                    # 提取段落文本
-                    for p in elem.findall(f'.//{DocxUtils.W_NS}p'):
-                        # 获取段落的完整文本，包括所有run
-                        para_text = ""
-                        for t_elem in p.findall(f'.//{DocxUtils.W_NS}t'):
-                            if t_elem.text:
-                                para_text += t_elem.text
-                        
-                        # 处理换行符
-                        for br_elem in p.findall(f'.//{DocxUtils.W_NS}br'):
-                            para_text += '\n'
-                        
-                        if para_text.strip():
-                            text_parts.append(para_text.strip())
-                    
-                    # 合并段落文本
-                    combined_text = ' '.join(text_parts) if text_parts else ""
-                    
-                    if combined_text.strip():
-                        textboxes.append([combined_text])
-                        # 获取文本框位置
-                        position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
-                        positions.append(position)
-                        self.log_file.write(f"    提取文本框文本: '{combined_text[:50]}...', 位置: {position}\n")
+                    inner_html_parts = self._traverse_document_body(elem)
+                    inner_html = "".join(inner_html_parts).strip()
+                    position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
+                    positions.append(position)
+                    textboxes.append({
+                        'elem': elem,
+                        'html': inner_html
+                    })
+                    self.log_file.write(f"    提取文本框HTML长度: {len(inner_html)}, 位置: {position}\n")
                 
                 # 方法2: 查找w:txbx（文本框）
                 elif elem.tag == DocxUtils.W_NS + 'txbx':
                     txbx_content = elem.find(f'.//{DocxUtils.W_NS}txbxContent')
                     if txbx_content is not None:
                         self.log_file.write(f"      找到txbx元素，包含txbxContent\n")
-                        text_parts = []
-                        
-                        # 提取段落文本
-                        for p in txbx_content.findall(f'.//{DocxUtils.W_NS}p'):
-                            para_text = ""
-                            for t_elem in p.findall(f'.//{DocxUtils.W_NS}t'):
-                                if t_elem.text:
-                                    para_text += t_elem.text
-                            
-                            for br_elem in p.findall(f'.//{DocxUtils.W_NS}br'):
-                                para_text += '\n'
-                            
-                            if para_text.strip():
-                                text_parts.append(para_text.strip())
-                        
-                        combined_text = ' '.join(text_parts) if text_parts else ""
-                        
-                        if combined_text.strip():
-                            textboxes.append([combined_text])
-                            position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
-                            positions.append(position)
-                            self.log_file.write(f"    提取文本框文本: '{combined_text[:50]}...', 位置: {position}\n")
+                        inner_html_parts = self._traverse_document_body(txbx_content)
+                        inner_html = "".join(inner_html_parts).strip()
+                        position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
+                        positions.append(position)
+                        textboxes.append({
+                            'elem': elem,
+                            'html': inner_html
+                        })
+                        self.log_file.write(f"    提取文本框HTML长度: {len(inner_html)}, 位置: {position}\n")
                 
                 # 方法3: 查找wp:docPr（文档属性）可能包含图片标注
                 elif elem.tag == DocxUtils.WP_NS + 'docPr':
@@ -1516,26 +1592,107 @@ class DocxToHTMLConverter:
                         if re.match(r'^\s*(图片|图|Image|Figure)\s*\d+\s*$', text_content, re.IGNORECASE):
                             self.log_file.write(f"    跳过默认docPr名称: '{text_content}'\n")
                         else:
-                            textboxes.append([text_content.strip()])
                             position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
                             positions.append(position)
+                            textboxes.append({
+                                'elem': elem,
+                                'html': escape(text_content.strip())
+                            })
                             self.log_file.write(f"    提取docPr文本: '{text_content}', 位置: {position}\n")
                 
                 # 方法4: 查找a:t（DrawingML文本）
                 elif elem.tag == DocxUtils.A_NS + 't':
                     if elem.text and elem.text.strip():
                         text_content = elem.text.strip()
-                        # 检查是否在文本框上下文中
                         parent = self._find_parent_with_tag(elem, [DocxUtils.W_NS + 'txbx', DocxUtils.W_NS + 'txbxContent'])
                         if parent:
-                            # 已经被上面的方法处理过，跳过
                             pass
                         else:
-                            # 可能是独立标注
-                            textboxes.append([text_content])
                             position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
                             positions.append(position)
+                            textboxes.append({
+                                'elem': elem,
+                                'html': escape(text_content)
+                            })
                             self.log_file.write(f"    提取DrawingML文本: '{text_content}', 位置: {position}\n")
+                
+                # 方法5: 查找DrawingML形状 a:sp + a:txBody 文本（Word形状文本框）
+                elif elem.tag == DocxUtils.A_NS + 'sp':
+                    spPr = elem.find(f'{DocxUtils.A_NS}spPr')
+                    shape_css = self._get_shape_style_css(spPr) if spPr is not None else ""
+                    txBody = elem.find(f'.//{DocxUtils.A_NS}txBody')
+                    if txBody is not None:
+                        text_parts = []
+                        for t in txBody.findall(f'.//{DocxUtils.A_NS}t'):
+                            if t.text:
+                                text_parts.append(t.text)
+                        inner_text = ''.join(text_parts).strip()
+                        inner_html = escape(inner_text)
+                        position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
+                        positions.append(position)
+                        textboxes.append({
+                            'elem': elem,
+                            'html': inner_html,
+                            'border_css': shape_css
+                        })
+                        self.log_file.write(f"    提取形状文本框: 文本长度={len(inner_html)}, 位置: {position}\n")
+                    else:
+                        position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
+                        positions.append(position)
+                        textboxes.append({
+                            'elem': elem,
+                            'html': '',
+                            'border_css': shape_css
+                        })
+                        self.log_file.write(f"    提取无文本形状: 位置: {position}\n")
+                
+                # 方法6: 组形状 a:grpSp（将整个组作为一个叠加层，保留宽高与边框）
+                elif elem.tag == DocxUtils.A_NS + 'grpSp':
+                    position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
+                    textboxes.append({
+                        'elem': elem,
+                        'html': ''
+                    })
+                    positions.append(position)
+                    self.log_file.write(f"    提取组形状grpSp: 位置: {position}\n")
+                
+                # 方法7: 连接线形状 a:cxnSp（通常无文本，但需保留其边框/线条作为叠加层）
+                elif elem.tag == DocxUtils.A_NS + 'cxnSp':
+                    position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
+                    textboxes.append({
+                        'elem': elem,
+                        'html': ''
+                    })
+                    positions.append(position)
+                    self.log_file.write(f"    提取连接形状cxnSp: 位置: {position}\n")
+                
+                # 方法8: WordprocessingShape 形状 wps:wsp（支持有文本和无文本形状）
+                elif elem.tag == DocxUtils.WPS_NS + 'wsp':
+                    # 提取形状样式
+                    spPr = elem.find(f'{DocxUtils.WPS_NS}spPr')
+                    style_css = self._get_shape_style_css(spPr) if spPr is not None else ""
+                    
+                    txBody = elem.find(f'.//{DocxUtils.A_NS}txBody')
+                    if txBody is not None:
+                        text_parts = []
+                        for t in txBody.findall(f'.//{DocxUtils.A_NS}t'):
+                            if t.text:
+                                text_parts.append(t.text)
+                        inner_text = ''.join(text_parts).strip()
+                        inner_html = escape(inner_text)
+                        # 如果有文本，且有样式，尝试把样式加到inner_html的外层div（如果之后是div的话）
+                        # 这里我们把样式存入 textbox dict，在生成叠加层时使用
+                    else:
+                        inner_html = ''
+                    
+                    position = self._get_textbox_position(elem, img_width, img_height, drawing_elem)
+                    positions.append(position)
+                    textboxes.append({
+                        'elem': elem,
+                        'html': inner_html,
+                        'border_css': style_css  # 将样式存入 border_css 字段，会被叠加层渲染逻辑使用
+                    })
+                    self.log_file.write(f"    提取wps形状: 文本长度={len(inner_html)}, 位置: {position}, 样式: {style_css}\n")
         
         except Exception as e:
             self.log_file.write(f"  提取文本框失败: {e}\n")
@@ -1545,6 +1702,73 @@ class DocxToHTMLConverter:
         self.log_file.write(f"    最终提取 {len(textboxes)} 个文本框\n")
         return textboxes, positions
     
+    def _get_shape_style_css(self, spPr):
+        """
+        从spPr元素中提取CSS样式
+        """
+        styles = []
+        try:
+            # 1. 填充颜色
+            # 只读取 spPr 直接子元素的 solidFill，避免误把 ln 内的线条颜色当作填充色
+            solidFill = spPr.find(f'{DocxUtils.A_NS}solidFill')
+            if solidFill is not None:
+                srgbClr = solidFill.find(f'{DocxUtils.A_NS}srgbClr')
+                if srgbClr is not None:
+                    val = srgbClr.get('val')
+                    if val:
+                        styles.append(f'background-color: #{val}')
+            
+            # 2. 边框
+            ln = spPr.find(f'{DocxUtils.A_NS}ln')
+            if ln is not None:
+                # 宽度
+                w = ln.get('w')
+                width_px = 1
+                if w:
+                    width_px = int(DocxUtils.emu_to_pixels(int(w), apply_scale=True))
+                    if width_px < 1: width_px = 1
+                
+                solidFill_ln = ln.find(f'{DocxUtils.A_NS}solidFill')
+                noFill_ln = ln.find(f'{DocxUtils.A_NS}noFill')
+                
+                if noFill_ln is not None:
+                    styles.append('border: none')
+                else:
+                    border_color = None
+                    if solidFill_ln is not None:
+                        srgbClr_ln = solidFill_ln.find(f'{DocxUtils.A_NS}srgbClr')
+                        if srgbClr_ln is not None:
+                            val = srgbClr_ln.get('val')
+                            if val:
+                                border_color = f'#{val}'
+                    
+                    # 线型
+                    border_style = 'solid'
+                    prstDash = ln.find(f'{DocxUtils.A_NS}prstDash')
+                    if prstDash is not None:
+                        val = prstDash.get('val')
+                        if val == 'dot': border_style = 'dotted'
+                        elif val == 'dash': border_style = 'dashed'
+                    
+                    if border_color:
+                        styles.append(f'border: {width_px}px {border_style} {border_color}')
+                    else:
+                        styles.append(f'border: {width_px}px {border_style}')
+
+            # 3. 几何形状 (圆角)
+            prstGeom = spPr.find(f'{DocxUtils.A_NS}prstGeom')
+            if prstGeom is not None:
+                prst = prstGeom.get('prst')
+                if prst == 'roundRect':
+                    styles.append('border-radius: 15px') # 默认圆角
+                elif prst == 'ellipse':
+                    styles.append('border-radius: 50%')
+
+        except Exception as e:
+            self.log_file.write(f"      提取形状样式失败: {e}\n")
+            
+        return '; '.join(styles)
+
     def _find_parent_with_tag(self, elem, tag_list):
         parent = elem
         try:
@@ -1566,8 +1790,8 @@ class DocxToHTMLConverter:
         
         Args:
             textbox_elem: 文本框元素
-            img_width: 图片宽度
-            img_height: 图片高度
+            img_width: 图片显示宽度（已应用缩放）
+            img_height: 图片显示高度（已应用缩放）
             drawing_elem: 外层drawing元素
             
         Returns:
@@ -1576,106 +1800,72 @@ class DocxToHTMLConverter:
         position = {'x': 0, 'y': 0, 'relative_from': None, 'position_mode': 'absolute', 'width': None, 'height': None}
         
         try:
-            # 方法1: 从外层drawing元素查找anchor定位
-            if drawing_elem is not None:
-                anchor = drawing_elem.find(f'.//{DocxUtils.WP_NS}anchor')
-                if anchor is not None:
-                    self.log_file.write(f"      使用anchor定位方式\n")
-                    
-                    # 水平定位
-                    positionH = anchor.find(f'.//{DocxUtils.WP_NS}positionH')
-                    if positionH is not None:
-                        relativeFrom = positionH.get(f'{DocxUtils.WP_NS}relativeFrom')
-                        posOffset = positionH.find(f'.//{DocxUtils.WP_NS}posOffset')
-                        
-                        if posOffset is not None and posOffset.text:
-                            offset_val = int(posOffset.text)
-                            offset_px = DocxUtils.emu_to_pixels(offset_val)
-                            
-                            position['relative_from'] = relativeFrom
-                            
-                            # 根据参考基准调整位置
-                            if relativeFrom == 'margin':
-                                offset_px += 100
-                            elif relativeFrom == 'page':
-                                pass
-                            elif relativeFrom == 'column':
-                                offset_px += 50
-                            elif relativeFrom == 'character':
-                                # 相对于字符，默认位置
-                                offset_px = img_width * 0.1
-                            
-                            position['x'] = max(10, min(int(offset_px), img_width - 50))
-                            self.log_file.write(f"        水平位置: {relativeFrom} -> {offset_px}px\n")
-                    
-                    # 垂直定位
-                    positionV = anchor.find(f'.//{DocxUtils.WP_NS}positionV')
-                    if positionV is not None:
-                        relativeFrom = positionV.get(f'{DocxUtils.WP_NS}relativeFrom')
-                        posOffset = positionV.find(f'.//{DocxUtils.WP_NS}posOffset')
-                        
-                        if posOffset is not None and posOffset.text:
-                            offset_val = int(posOffset.text)
-                            offset_px = DocxUtils.emu_to_pixels(offset_val)
-                            
-                            position['relative_from_v'] = relativeFrom
-                            
-                            # 根据参考基准调整位置
-                            if relativeFrom == 'margin':
-                                offset_px += 100
-                            elif relativeFrom == 'page':
-                                pass
-                            elif relativeFrom == 'paragraph':
-                                position['position_mode'] = 'relative'
-                            elif relativeFrom == 'line':
-                                offset_px = img_height * 0.1
-                            
-                            position['y'] = max(10, min(int(offset_px), img_height - 50))
-                            self.log_file.write(f"        垂直位置: {relativeFrom} -> {offset_px}px\n")
+            original_img_width, original_img_height = self._get_original_image_size(drawing_elem)
+            scale_x = img_width / original_img_width if original_img_width > 0 else 1
+            scale_y = img_height / original_img_height if original_img_height > 0 else 1
             
-            # 方法2: 从文本框元素自身查找定位信息
-            # 查找w:tblPr或w:pPr中的定位
-            if position['x'] == 0 and position['y'] == 0:
-                # 查找shape的偏移
-                for elem in textbox_elem.iter():
-                    if elem.tag == DocxUtils.A_NS + 'off':
-                        x = elem.get('x', 0)
-                        y = elem.get('y', 0)
-                        if x:
-                            position['x'] = DocxUtils.emu_to_pixels(int(x))
-                        if y:
-                            position['y'] = DocxUtils.emu_to_pixels(int(y))
-                        self.log_file.write(f"        从off获取位置: x={position['x']}, y={position['y']}\n")
-                        break
-                    if elem.tag == DocxUtils.A_NS + 'ext':
-                        cx = elem.get('cx')
-                        cy = elem.get('cy')
+            # 情况1：textbox_elem 本身是一个独立的 w:drawing（与底图属于不同drawing）
+            # 这种情况用于段落中的“独立文本框”挂到同段第一张图片上
+            if hasattr(textbox_elem, 'tag') and textbox_elem.tag == DocxUtils.W_NS + 'drawing' and drawing_elem is not None and textbox_elem is not drawing_elem:
+                try:
+                    base_x, base_y = self._get_anchor_offsets(drawing_elem)
+                    tb_x, tb_y = self._get_anchor_offsets(textbox_elem)
+                    position['x'] = int(tb_x - base_x)
+                    position['y'] = int(tb_y - base_y)
+                    self.log_file.write(f"        独立drawing锚点差定位: base=({base_x},{base_y}), tb=({tb_x},{tb_y}), rel=({position['x']},{position['y']})\n")
+                except Exception:
+                    pass
+                
+                # 尝试读取该文本框自身的宽高（按页面缩放后的像素）
+                try:
+                    extent = textbox_elem.find(f'.//{DocxUtils.WP_NS}extent')
+                    if extent is not None:
+                        cx = extent.get('cx')
+                        cy = extent.get('cy')
                         if cx:
-                            position['width'] = DocxUtils.emu_to_pixels(int(cx))
+                            position['width'] = DocxUtils.emu_to_pixels(int(cx), apply_scale=True)
                         if cy:
-                            position['height'] = DocxUtils.emu_to_pixels(int(cy))
+                            position['height'] = DocxUtils.emu_to_pixels(int(cy), apply_scale=True)
+                except Exception:
+                    pass
+                
+                self.log_file.write(f"      最终文本框位置: x={position['x']}, y={position['y']}\n")
+                return position
             
-            # 方法3: 从图片的extent推算文本框位置（如果文本框在图片上方）
+            # 情况2：textbox_elem 是底图drawing内部的元素，使用 a:off / a:ext 相对底图定位
+            for elem in textbox_elem.iter():
+                if elem.tag == DocxUtils.A_NS + 'off':
+                    x = elem.get('x', 0)
+                    y = elem.get('y', 0)
+                    original_x, original_y = 0, 0
+                    if x:
+                        original_x = DocxUtils.emu_to_pixels(int(x), apply_scale=True)
+                        position['x'] = int(original_x * scale_x)
+                    if y:
+                        original_y = DocxUtils.emu_to_pixels(int(y), apply_scale=True)
+                        position['y'] = int(original_y * scale_y)
+                    self.log_file.write(f"        从off获取位置(相对底图): original=({original_x}, {original_y}) -> scaled=({position['x']}, {position['y']})\n")
+                if elem.tag == DocxUtils.A_NS + 'ext':
+                    cx = elem.get('cx')
+                    cy = elem.get('cy')
+                    if cx:
+                        position['width'] = DocxUtils.emu_to_pixels(int(cx), apply_scale=True) * scale_x
+                    if cy:
+                        position['height'] = DocxUtils.emu_to_pixels(int(cy), apply_scale=True) * scale_y
+            
+            # 情况3：仍然没有位置信息时，尝试使用锚点差进行兜底（textbox_elem 为某些外层元素）
             if position['x'] == 0 and position['y'] == 0 and drawing_elem is not None:
-                extent = drawing_elem.find(f'.//{DocxUtils.WP_NS}extent')
-                if extent is not None:
-                    cx = extent.get('cx')
-                    cy = extent.get('cy')
-                    if cx and cy:
-                        # 将文本框放在图片左上角
-                        position['x'] = int(img_width * 0.05)
-                        position['y'] = int(img_height * 0.05)
-                        self.log_file.write(f"        使用extent推算位置: x={position['x']}, y={position['y']}\n")
-            
-            # 方法4: 最后使用默认位置
-            if position['x'] == 0 and position['y'] == 0:
-                position['x'] = int(img_width * 0.1)
-                position['y'] = int(img_height * 0.1)
-                self.log_file.write(f"        使用默认位置: x={position['x']}, y={position['y']}\n")
-            
-            # 确保位置在图片范围内
-            position['x'] = max(10, min(int(position['x']), img_width - 100))
-            position['y'] = max(10, min(int(position['y']), img_height - 50))
+                try:
+                    base_x, base_y = self._get_anchor_offsets(drawing_elem)
+                    tb_x, tb_y = 0, 0
+                    if hasattr(textbox_elem, 'tag') and textbox_elem.tag == DocxUtils.W_NS + 'drawing':
+                        tb_x, tb_y = self._get_anchor_offsets(textbox_elem)
+                    if tb_x or tb_y:
+                        position['x'] = int(tb_x - base_x)
+                        position['y'] = int(tb_y - base_y)
+                        self.log_file.write(f"        兜底锚点差定位: x={position['x']}, y={position['y']}\n")
+                except Exception:
+                    pass
             
         except Exception as e:
             self.log_file.write(f"  获取文本框位置失败: {e}\n")
@@ -1859,24 +2049,8 @@ class DocxToHTMLConverter:
                         img_style.append(f'width: {int(img["width"])}px')
                     if img['height']:
                         img_style.append(f'height: {int(img["height"])}px')
-                    has_textbox = any(x.get('type') == 'textbox' for x in images)
                     if img.get('wrap_style'):
-                        # 若存在文本框且wrap为左浮动，则改为右浮动以匹配混排布局
-                        if has_textbox and img['wrap_style'] == 'float: left':
-                            img_style.append('float: right')
-                        else:
-                            # 若存在段落文本且图片较小，优先将图片置于右侧形成图文混排
-                            if has_text_content and img['wrap_style'] == 'float: left' and img.get('width') and img['width'] <= 400:
-                                img_style.append('float: right')
-                            else:
-                                img_style.append(img['wrap_style'])
-                    else:
-                        # 如果同段存在文本框而未给定wrap，优先让图片靠右以实现混排
-                        if has_textbox:
-                            img_style.append('float: right')
-                        # 如果无文本框，但段落存在文本内容，优先将图片靠右以便文字在左侧
-                        elif has_text_content:
-                            img_style.append('float: right')
+                        img_style.append(img['wrap_style'])
                     
                     # 保持仅基于XML的尺寸，不添加静态样式
                     
@@ -1889,22 +2063,41 @@ class DocxToHTMLConverter:
                             container_styles.append(f'height: {int(img["height"])}px')
                         container_styles.append('position: relative')
                         container_str = '; '.join(container_styles)
-                        img_style_str = '; '.join(img_style)
+                        # 背景图片：绝对定位铺满容器，作为底层背景
+                        bg_img_style = []
+                        if img.get('width'):
+                            bg_img_style.append(f'width: {int(img["width"])}px')
+                        if img.get('height'):
+                            bg_img_style.append(f'height: {int(img["height"])}px')
+                        bg_img_style.append('position: absolute')
+                        bg_img_style.append('left: 0')
+                        bg_img_style.append('top: 0')
+                        bg_img_style.append('z-index: 0')
+                        img_style_str = '; '.join(bg_img_style)
                         img_path = f"./images/{img['filename']}"
                         html += f'<div style="{container_str}">'
                         html += f'<img src="{img_path}" style="{img_style_str}" alt="{img["filename"]}" />'
                         # 叠加层
                         for ov in img['overlays']:
-                            ov_styles = ['position: absolute']
-                            ov_styles.append(f'left: {int(ov["x"])}px')
-                            ov_styles.append(f'top: {int(ov["y"])}px')
+                            ov_styles = ['position: absolute', 'z-index: 1']
+                            ov_styles.append(f'left: {int(ov.get("x", 0))}px')
+                            ov_styles.append(f'top: {int(ov.get("y", 0))}px')
                             if ov.get('width'):
                                 ov_styles.append(f'width: {int(ov["width"])}px')
                             if ov.get('height'):
                                 ov_styles.append(f'height: {int(ov["height"])}px')
+                            if ov.get('border_css'):
+                                ov_styles.append(ov['border_css'])
                             ov_style_str = '; '.join(ov_styles)
-                            escaped_text = escape(ov.get('text', ''))
-                            html += f'<div style="{ov_style_str}">{escaped_text}</div>'
+                            if ov.get('type') == 'image' and ov.get('filename'):
+                                oimg_path = f'./images/{ov["filename"]}'
+                                html += f'<img src="{oimg_path}" style="{ov_style_str}" alt="{ov["filename"]}" />'
+                            else:
+                                if ov.get('html'):
+                                    html += f'<div style="{ov_style_str}">{ov["html"]}</div>'
+                                else:
+                                    escaped_text = escape(ov.get('text', ''))
+                                    html += f'<div style="{ov_style_str}">{escaped_text}</div>'
                         html += '</div>'
                     else:
                         img_style_str = '; '.join(img_style)
@@ -1952,12 +2145,12 @@ class DocxToHTMLConverter:
                                 hanging = ind.get(qn('w:hanging'))
                                 if hanging:
                                     hanging_twip = int(hanging)
-                                    hanging_width = max(15, int(DocxUtils.twip_to_pixels(hanging_twip)))
+                                    hanging_width = max(15, int(DocxUtils.twip_to_pixels(hanging_twip, apply_scale=False)))
                                 else:
                                     left = ind.get(qn('w:left'))
                                     if left:
                                         left_twip = int(left)
-                                        left_px = int(DocxUtils.twip_to_pixels(left_twip))
+                                        left_px = int(DocxUtils.twip_to_pixels(left_twip, apply_scale=False))
                                         hanging_width = max(15, left_px // 3)
                         number_style_str = '; '.join(number_style)
                         prefix_html = f'<span style="{number_style_str}">{number}.</span><span style="display:inline-block; width:{hanging_width}px;"></span>'
@@ -1987,12 +2180,12 @@ class DocxToHTMLConverter:
                             hanging = ind.get(qn('w:hanging'))
                             if hanging:
                                 hanging_twip = int(hanging)
-                                hanging_width = max(15, int(DocxUtils.twip_to_pixels(hanging_twip)))
+                                hanging_width = max(15, int(DocxUtils.twip_to_pixels(hanging_twip, apply_scale=False)))
                             else:
                                 left = ind.get(qn('w:left'))
                                 if left:
                                     left_twip = int(left)
-                                    left_px = int(DocxUtils.twip_to_pixels(left_twip))
+                                    left_px = int(DocxUtils.twip_to_pixels(left_twip, apply_scale=False))
                                     hanging_width = max(15, left_px // 3)
                     bullet_style = '; '.join(bullet_styles)
                     prefix_html = f'<span style="{bullet_style}">{bullet_char}</span><span style="display:inline-block; width:{hanging_width}px;"></span>'
@@ -2220,6 +2413,7 @@ class DocxToHTMLConverter:
     def extract_images_from_paragraph(self, paragraph):
         """从段落中提取图片"""
         images = []
+        pending_textboxes = []
         self.log_file.write(f"  开始从段落中提取图片: {paragraph.text[:50]}...\n")
         
         for run_idx, run in enumerate(paragraph.runs):
@@ -2232,27 +2426,54 @@ class DocxToHTMLConverter:
                     blip_elements = drawing.findall(f'.//{DocxUtils.A_NS}blip')
                     self.log_file.write(f"      Drawing {drawing_idx}: 找到 {len(blip_elements)} 个blip元素\n")
                     
-                    # 如果没有图片，检查是否为独立文本框
+                    # 如果没有图片，检查是否为独立文本框或形状
                     if not blip_elements:
-                        # 查找txbxContent
                         txbx_content = drawing.find(f'.//{DocxUtils.W_NS}txbxContent')
                         if txbx_content is not None:
                             self.log_file.write(f"      Drawing {drawing_idx}: 找到独立文本框，提取内容\n")
-                            # 递归处理文本框内容
-                            # 注意：这里需要传入table_context=None或者保持上下文，暂时传入None
                             inner_html_parts = self._traverse_document_body(txbx_content)
                             inner_html = "".join(inner_html_parts)
-                            
                             if inner_html:
-                                style = self._get_txbx_div_style(drawing)
-                                images.append({
-                                    'type': 'textbox',
-                                    'html': inner_html,
-                                    'style': style,
-                                    'filename': None,
-                                    'width': None,
-                                    'height': None
+                                pending_textboxes.append({
+                                    'elem': drawing,
+                                    'html': inner_html
                                 })
+                            continue
+                        found_shape = None
+                        found_tag = None
+                        for shape_tag in [
+                            DocxUtils.WPS_NS + 'wsp',
+                            DocxUtils.A_NS + 'sp',
+                            DocxUtils.A_NS + 'grpSp',
+                            DocxUtils.A_NS + 'cxnSp',
+                        ]:
+                            found_shape = drawing.find(f'.//{shape_tag}')
+                            if found_shape is not None:
+                                found_tag = shape_tag
+                                break
+                        
+                        if found_shape is not None:
+                            self.log_file.write(f"      Drawing {drawing_idx}: 找到独立形状 {found_tag}，作为叠加层\n")
+                            
+                            # 尝试提取样式
+                            style_css = ""
+                            try:
+                                if found_tag == DocxUtils.WPS_NS + 'wsp':
+                                    spPr = found_shape.find(f'{DocxUtils.WPS_NS}spPr')
+                                    if spPr is not None:
+                                        style_css = self._get_shape_style_css(spPr)
+                                elif found_tag == DocxUtils.A_NS + 'sp':
+                                    spPr = found_shape.find(f'{DocxUtils.A_NS}spPr')
+                                    if spPr is not None:
+                                        style_css = self._get_shape_style_css(spPr)
+                            except Exception as e:
+                                self.log_file.write(f"      提取独立形状样式失败: {e}\n")
+
+                            pending_textboxes.append({
+                                'elem': drawing,
+                                'html': '',
+                                'border_css': style_css
+                            })
                             continue
                     
                     for blip_idx, blip in enumerate(blip_elements):
@@ -2276,7 +2497,8 @@ class DocxToHTMLConverter:
                                     'width': int(image_info['width']) if image_info.get('width') else None,
                                     'height': int(image_info['height']) if image_info.get('height') else None,
                                     'wrap_style': wrap_style,
-                                    'overlays': image_info.get('overlays', [])
+                                    'overlays': image_info.get('overlays', []),
+                                    'drawing_elem': drawing
                                 })
                             else:
                                 self.log_file.write(f"        提取图片失败: {r_embed}\n")
@@ -2284,7 +2506,112 @@ class DocxToHTMLConverter:
                             self.log_file.write(f"        Blip {blip_idx}: 无embed属性\n")
         
         self.log_file.write(f"  段落图片提取完成，共 {len(images)} 个图片\n")
+        
+        # 如同段存在多张图片，选取最大的一张作为底图，其余按锚点位置转为叠加图片
+        try:
+            base = None
+            max_area = -1
+            for it in images:
+                if it.get('type') == 'image' and it.get('width') and it.get('height'):
+                    area = it['width'] * it['height']
+                    if area > max_area:
+                        max_area = area
+                        base = it
+            if base is not None:
+                base_x, base_y = self._get_anchor_offsets(base.get('drawing_elem'))
+                # 收集需要转为叠加的图片
+                remaining = []
+                for it in images:
+                    if it is base:
+                        continue
+                    if it.get('type') == 'image':
+                        ox, oy = self._get_anchor_offsets(it.get('drawing_elem'))
+                        rel_x = int(ox - base_x)
+                        rel_y = int(oy - base_y)
+                        overlay = {
+                            'type': 'image',
+                            'filename': it.get('filename'),
+                            'x': rel_x,
+                            'y': rel_y,
+                            'width': it.get('width'),
+                            'height': it.get('height')
+                        }
+                        base['overlays'].append(overlay)
+                    else:
+                        remaining.append(it)
+                # 重建images列表，仅保留底图和非图片元素
+                images = [base] + remaining
+                
+                # 将同段独立文本框统一附着到底图上（避免挂到非底图后被重组丢失）
+                if pending_textboxes:
+                    display_w = base.get('width') or 0
+                    display_h = base.get('height') or 0
+                    drawing_elem = base.get('drawing_elem')
+                    for tb in pending_textboxes:
+                        pos = self._get_textbox_position(tb['elem'], display_w, display_h, drawing_elem)
+                        overlay = {
+                            'type': 'text',
+                            'html': tb['html'],
+                            'x': int(pos.get('x', 0)),
+                            'y': int(pos.get('y', 0)),
+                            'width': int(pos.get('width')) if pos.get('width') else None,
+                            'height': int(pos.get('height')) if pos.get('height') else None
+                        }
+                        border_css = tb.get('border_css')
+                        if not border_css:
+                            border_css = self._get_shape_border_css(tb['elem'])
+                        if border_css:
+                            overlay['border_css'] = border_css
+                        base['overlays'].append(overlay)
+        except Exception:
+            pass
+        
         return images
+    
+    def _get_anchor_offsets(self, drawing_elem):
+        """获取drawing的锚点绝对位置（页面坐标，像素，已按页面缩放）"""
+        x_px, y_px = 0, 0
+        try:
+            anchor = drawing_elem.find(f'.//{DocxUtils.WP_NS}anchor')
+            if anchor is not None:
+                positionH = anchor.find(f'.//{DocxUtils.WP_NS}positionH')
+                if positionH is not None:
+                    posOffset = positionH.find(f'.//{DocxUtils.WP_NS}posOffset')
+                    if posOffset is not None and posOffset.text:
+                        x_px = DocxUtils.emu_to_pixels(int(posOffset.text), apply_scale=True)
+                positionV = anchor.find(f'.//{DocxUtils.WP_NS}positionV')
+                if positionV is not None:
+                    posOffset = positionV.find(f'.//{DocxUtils.WP_NS}posOffset')
+                    if posOffset is not None and posOffset.text:
+                        y_px = DocxUtils.emu_to_pixels(int(posOffset.text), apply_scale=True)
+        except Exception:
+            pass
+        return x_px, y_px
+    
+    def _get_shape_border_css(self, elem):
+        """提取shape边框样式为CSS（宽度近似1px，颜色取srgbClr）"""
+        try:
+            for ln in elem.findall(f'.//{DocxUtils.A_NS}ln'):
+                color = None
+                solid = ln.find(f'.//{DocxUtils.A_NS}solidFill')
+                if solid is not None:
+                    srgb = solid.find(f'.//{DocxUtils.A_NS}srgbClr')
+                    if srgb is not None and srgb.get('val'):
+                        color = f'#{srgb.get("val")}'
+                if color:
+                    return f'border: 1px solid {color}'
+            # 兼容wps:spPr中的线条
+            for spPr in elem.findall(f'.//{DocxUtils.A_NS}spPr'):
+                ln = spPr.find(f'.//{DocxUtils.A_NS}ln')
+                if ln is not None:
+                    solid = ln.find(f'.//{DocxUtils.A_NS}solidFill')
+                    if solid is not None:
+                        srgb = solid.find(f'.//{DocxUtils.A_NS}srgbClr')
+                        if srgb is not None and srgb.get('val'):
+                            return f'border: 1px solid #{srgb.get("val")}'
+        except Exception:
+            pass
+        return None
     
     def process_table(self, table, table_index, table_context=None):
         """处理表格"""
@@ -2540,18 +2867,18 @@ class DocxToHTMLConverter:
                     cx = elem.get('cx')
                     cy = elem.get('cy')
                     if cx:
-                        width = DocxUtils.emu_to_pixels(int(cx))
+                        width = DocxUtils.emu_to_pixels(int(cx), apply_scale=True)
                     if cy:
-                        height = DocxUtils.emu_to_pixels(int(cy))
+                        height = DocxUtils.emu_to_pixels(int(cy), apply_scale=True)
                     break
             for elem in txbx_elem.iter():
                 if elem.tag == DocxUtils.A_NS + 'off':
                     x = elem.get('x')
                     y = elem.get('y')
                     if x:
-                        left = DocxUtils.emu_to_pixels(int(x))
+                        left = DocxUtils.emu_to_pixels(int(x), apply_scale=True)
                     if y:
-                        top = DocxUtils.emu_to_pixels(int(y))
+                        top = DocxUtils.emu_to_pixels(int(y), apply_scale=True)
                     break
             if width:
                 parts.append(f'width:{int(width)}px')
@@ -2590,7 +2917,7 @@ class DocxToHTMLConverter:
                     posOffset = positionH.find(f'.//{DocxUtils.WP_NS}posOffset')
                     if posOffset is not None and posOffset.text:
                         try:
-                            offset_px = DocxUtils.emu_to_pixels(int(posOffset.text))
+                            offset_px = DocxUtils.emu_to_pixels(int(posOffset.text), apply_scale=True)
                             # 依据页面宽度的一半作为分界线进行左右推断
                             page_width_px = 1200
                             if offset_px >= page_width_px // 2:
