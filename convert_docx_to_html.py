@@ -51,6 +51,7 @@ class DocxToHTMLConverter:
 
         # 目录相关
         self.headings_map = {}  # 标题映射: {heading_text: heading_id}
+        self.paragraph_ids = {} # 段落ID映射: {paragraph_element: heading_id}
         self.toc_titles = set()  # 目录条目集合，用于辅助识别标题
 
         # 列表编号追踪
@@ -628,15 +629,15 @@ class DocxToHTMLConverter:
                             border_style += '; padding: 4px 8px'
                         self.log_file.write(f"    检查边框样式: {border_style}\n")
             
-            if has_toc_bookmark and (is_toc_style or has_toc_pattern):
+            if (has_toc_bookmark and (is_toc_style or has_toc_pattern)) or (is_toc_style and has_toc_pattern) or (has_toc_pattern and ('\t' in raw_text or '  ' in raw_text)):
                 # 获取段落的完整文本内容
                 raw_text = paragraph.text.strip()
                 self.log_file.write(f"    目录原始文本: '{raw_text}'\n")
                 
                 # 移除制表符（&emsp;&emsp;实际上是制表符或空格）
                 # 先处理HTML实体编码的制表符
-                cleaned_text = raw_text.replace('&emsp;', ' ').replace('&ensp;', ' ').replace('\u2003', ' ')
-                cleaned_text = re.sub(r'[\t ]{2,}', ' ', cleaned_text)
+                cleaned_text = raw_text.replace('&emsp;', '').replace('&ensp;', '').replace('\u2003', '')
+                cleaned_text = re.sub(r'[\t ]{2,}', '', cleaned_text)
                 cleaned_text = re.sub(r'^\s+', '', cleaned_text)
                 
                 # 移除页码（包括点号分隔的页码，以及HTML实体形式的空格）
@@ -648,12 +649,8 @@ class DocxToHTMLConverter:
                 title_text = re.sub(r'[.\u2026\u2003]+$', '', title_text)
                 title_text = title_text.strip()
                 
-                # 再次清理开头可能的序号（如"1. "）
-                title_text = re.sub(r'^\d+\.\s*', '', title_text)
-                title_text = title_text.strip()
-                
                 # 移除中间的多余空格、制表符和HTML实体
-                title_text = re.sub(r'(?:&nbsp;|\u00A0|\s)+', ' ', title_text)
+                title_text = re.sub(r'(?:&nbsp;|\u00A0|\s)+', '', title_text)
                 title_text = title_text.strip()
                 
                 self.log_file.write(f"    目录清理后文本: '{title_text}'\n")
@@ -666,6 +663,52 @@ class DocxToHTMLConverter:
         
         return False, None, None
     
+    def _should_merge_paragraphs(self, p1, p2):
+        """判断两个段落是否应该合并（用于处理连续的浮动图片/文本框）"""
+        try:
+            # 检查p1是否包含浮动drawing
+            has_float1 = False
+            for drawing in p1.findall(f'.//{DocxUtils.W_NS}drawing'):
+                if drawing.find(f'.//{DocxUtils.WP_NS}anchor') is not None:
+                    has_float1 = True
+                    break
+            
+            if not has_float1:
+                return False
+                
+            # 检查p2是否包含浮动drawing
+            has_float2 = False
+            for drawing in p2.findall(f'.//{DocxUtils.W_NS}drawing'):
+                if drawing.find(f'.//{DocxUtils.WP_NS}anchor') is not None:
+                    has_float2 = True
+                    break
+                    
+            if not has_float2:
+                return False
+            
+            # 检查p2是否有直接的文本内容（不包含drawing内的文本）
+            # 如果p2有直接文本（如标题、说明文字），则不应合并，应保留为独立段落
+            has_direct_text = False
+            for r in p2.findall(f'{DocxUtils.W_NS}r'):
+                for t in r.findall(f'{DocxUtils.W_NS}t'):
+                    if t.text and t.text.strip():
+                        has_direct_text = True
+                        break
+                if has_direct_text:
+                    break
+            
+            if has_direct_text:
+                return False
+            
+            return True
+        except Exception:
+            return False
+
+    def _merge_paragraph_elements(self, target_p, source_p):
+        """将source_p的内容合并到target_p"""
+        for run in source_p.findall(f'{DocxUtils.W_NS}r'):
+            target_p.append(run)
+
     def _traverse_document_body(self, body_element, table_context=None, progress=None):
         """
         递归遍历文档body元素，按文档实际顺序处理所有元素
@@ -682,7 +725,12 @@ class DocxToHTMLConverter:
         
         self.log_file.write(f"\n--- 开始遍历文档元素，共 {len(body_element)} 个子元素 ---\n")
         
-        for elem in body_element:
+        # 使用索引遍历，以便跳过已合并的元素
+        i = 0
+        total_len = len(body_element)
+        
+        while i < total_len:
+            elem = body_element[i]
             element_count += 1
             self.log_file.write(f"处理第 {element_count} 个元素: {elem.tag}\n")
             if progress is not None:
@@ -694,6 +742,27 @@ class DocxToHTMLConverter:
             # 处理段落 <w:p>
             if elem.tag == DocxUtils.W_NS + 'p':
                 self.log_file.write(f"  -> 发现段落元素\n")
+                
+                # 尝试合并后续连续的浮动段落
+                next_idx = i + 1
+                while next_idx < total_len:
+                    next_elem = body_element[next_idx]
+                    if next_elem.tag == DocxUtils.W_NS + 'p' and self._should_merge_paragraphs(elem, next_elem):
+                        self.log_file.write(f"  -> 合并后续浮动段落: {next_idx}\n")
+                        self._merge_paragraph_elements(elem, next_elem)
+                        # 更新进度条，因为我们跳过了一个元素
+                        if progress is not None:
+                            try:
+                                progress.update(1)
+                            except Exception:
+                                pass
+                        next_idx += 1
+                    else:
+                        break
+                
+                # 更新主循环索引
+                i = next_idx
+                
                 from docx.text.paragraph import Paragraph
                 para = Paragraph(elem, self.doc)
                 html_parts.append(self.process_paragraph(para, table_context=table_context))
@@ -704,6 +773,7 @@ class DocxToHTMLConverter:
                 from docx.table import Table
                 tbl = Table(elem, self.doc)
                 html_parts.append(self.process_table(tbl, len(html_parts) + 1, table_context=table_context))
+                i += 1
             
             # 处理文本框 <w:txbxContent> - 递归处理
             elif elem.tag == DocxUtils.W_NS + 'txbxContent':
@@ -718,6 +788,7 @@ class DocxToHTMLConverter:
                         html_parts.append('<div>')
                     html_parts.extend(nested_html)
                     html_parts.append('</div>')
+                i += 1
             
             # 处理其他自定义XML元素，递归处理其子元素
             elif len(elem) > 0:
@@ -726,10 +797,12 @@ class DocxToHTMLConverter:
                 nested_html = self._traverse_document_body(elem, table_context)
                 if nested_html:
                     html_parts.extend(nested_html)
+                i += 1
             
             # 跳过其他叶子元素
             else:
                 self.log_file.write(f"  -> 跳过叶子元素: {elem.tag}\n")
+                i += 1
         
         self.log_file.write(f"--- 遍历完成，共处理 {element_count} 个元素，生成 {len(html_parts)} 个HTML片段 ---\n")
         return html_parts
@@ -792,10 +865,10 @@ class DocxToHTMLConverter:
                         fake_run_style = style
                         self._process_hyperlink(hyperlink_parent, link_text, fake_run_style, html_parts)
                     continue
-                # 检查文本是否为点号或句号，如果是，则在后面添加一个空格
+                # 检查文本是否为点号或句号
                 if text in ['.', '。', '、', '，']:
                     text_buffer.append(text)
-                    text_buffer.append(' ')  # 在标点后添加一个空格
+                    text_buffer.append('  ')
                 else:
                     text_buffer.append(text)
             
@@ -1073,6 +1146,12 @@ class DocxToHTMLConverter:
         # 首先尝试精确匹配
         if title_text in self.headings_map:
             return self.headings_map[title_text]
+            
+        # 尝试忽略空格的精确匹配
+        title_norm = title_text.replace(' ', '').replace('\t', '')
+        for heading_text, heading_id in self.headings_map.items():
+            if heading_text.replace(' ', '').replace('\t', '') == title_norm:
+                return heading_id
         
         # 尝试包含匹配
         for heading_text, heading_id in self.headings_map.items():
@@ -2008,14 +2087,96 @@ class DocxToHTMLConverter:
             self.log_file.write(f"  异常详情: {traceback.format_exc()}\n")
             return img
     
+    def _get_list_prefix_html(self, paragraph):
+        """获取列表前缀HTML（序号或项目符号）"""
+        list_info, level, list_id, list_color, numFmt, bullet_size = self.parse_list_from_xml(paragraph)
+        
+        if not list_info:
+            return ""
+            
+        prefix_html = ""
+        if list_info == 'numbered':
+            # 获取编号
+            number = self._get_list_number(list_id, level, numFmt)
+            if number:
+                number_style = []
+                if list_color:
+                    number_style.append(f'color: {list_color}')
+                else:
+                    number_style.append('color: inherit')
+                # 字号
+                number_size_px = self._get_list_number_size_from_xml(paragraph)
+                if number_size_px:
+                    number_style.append(f'font-size: {number_size_px}px')
+                # 间距依据悬挂缩进/左缩进
+                hanging_width = 15
+                pPr = paragraph._element.pPr
+                if pPr is not None:
+                    ind = pPr.find(qn('w:ind'))
+                    if ind is not None:
+                        hanging = ind.get(qn('w:hanging'))
+                        if hanging:
+                            hanging_twip = int(hanging)
+                            hanging_width = max(15, int(DocxUtils.twip_to_pixels(hanging_twip)))
+                        else:
+                            left = ind.get(qn('w:left'))
+                            if left:
+                                left_twip = int(left)
+                                left_px = int(DocxUtils.twip_to_pixels(left_twip))
+                                hanging_width = max(15, left_px // 3)
+                
+                number_style_str = '; '.join(number_style)
+                prefix_html = f'<span style="{number_style_str}">{number}.</span><span style="display:inline-block; width:{hanging_width}px;"></span>'
+        elif list_info == 'bulleted':
+            # 项目符号
+            bullet_char = list_id if list_id else '•'
+            bullet_styles = []
+            if list_color:
+                bullet_styles.append(f'color: {list_color}')
+            else:
+                bullet_styles.append('color: inherit')
+            # 加粗依据XML
+            try:
+                rPr0 = paragraph.runs[0]._element.rPr if paragraph.runs else None
+                if rPr0 is not None:
+                    b0 = rPr0.find(qn('w:b'))
+                    if b0 is not None and b0.get(qn('w:val')) != '0':
+                        bullet_styles.append('font-weight: bold')
+            except Exception:
+                pass
+
+            if bullet_size:
+                bullet_size_px = int(bullet_size * 1.33)
+                bullet_styles.append(f'font-size: {bullet_size_px}px')
+
+            # 从段落属性获取首行缩进，如果没有则使用默认值
+            pPr = paragraph._element.pPr
+            hanging_width = 15  # 默认15px，增加间隔
+            if pPr is not None:
+                ind = pPr.find(qn('w:ind'))
+                if ind is not None:
+                    hanging = ind.get(qn('w:hanging'))
+                    if hanging:
+                        hanging_twip = int(hanging)
+                        hanging_width = max(15, int(DocxUtils.twip_to_pixels(hanging_twip)))
+                    else:
+                        # 如果没有hanging，检查left缩进
+                        left = ind.get(qn('w:left'))
+                        if left:
+                            left_twip = int(left)
+                            left_px = int(DocxUtils.twip_to_pixels(left_twip))
+                            hanging_width = max(15, left_px // 3)  # 左缩进的1/3作为项目符号间隔
+
+            bullet_style = '; '.join(bullet_styles)
+            prefix_html = f'<span style="{bullet_style}">{bullet_char}</span><span style="display:inline-block; width:{hanging_width}px;"></span>'
+            
+        return prefix_html
+
     def process_paragraph(self, paragraph, paragraph_index=None, table_context=None):
         """处理段落 - 基于XML解析"""
         # 只记录简要日志，减少I/O
         if paragraph_index and paragraph_index % 100 == 0:
             self.log_file.write(f"处理段落: {paragraph_index}\n")
-        
-        style_name = paragraph.style.name.lower() if paragraph.style else "None"
-        raw_text = paragraph.text
         
         # 检查是否包含图片
         images = self.extract_images_from_paragraph(paragraph)
@@ -2026,24 +2187,102 @@ class DocxToHTMLConverter:
             # 图片段落
             self.log_file.write(f"图片段落: {len(images)} 个图片\n")
             style = self._get_paragraph_format_from_xml(paragraph)
-            container_style = f"{style}" if style else ""
-            
-            html += f'<div style="{container_style}">'
+            base_style = f"{style}" if style else ""
+            container_style = base_style
             
             # 预先提取段落文本内容，便于决定图片的混排位置
             text_content = self.extract_paragraph_text_with_links(paragraph)
             has_text_content = bool(text_content and text_content.strip())
             
+            # 检查是否有浮动图片，如果有则添加清除浮动样式
+            has_float = False
+            for img in images:
+                if img.get('wrap_style') and 'float' in img['wrap_style']:
+                    has_float = True
+                    break
+            
+            if has_float and has_text_content:
+                prefix_html = self._get_list_prefix_html(paragraph)
+                html += f'<p style="{base_style}">{prefix_html}{text_content}</p>'
+                has_text_content = False 
+
+            if has_float:
+                container_style += "; overflow: hidden;"
+            
+            html += f'<div style="{container_style}">'
+            
             # 处理图片
             for i, img in enumerate(images):
                 if img.get('type') == 'textbox':
-                    # 处理文本框
-                    tb_style = img.get('style', '')
+                    # 处理独立文本框
+                    tb_styles = []
+                    if img.get('width'):
+                        tb_styles.append(f'width: {int(img["width"])}px')
+                    # height往往不固定，让内容撑开，或者如有明确高度则设置
+                    if img.get('height'):
+                         # 某些文本框高度可能只是最小高度
+                        tb_styles.append(f'min-height: {int(img["height"])}px')
+                    
+                    if img.get('wrap_style'):
+                        tb_styles.append(img['wrap_style'])
+                    
+                    if img.get('border_css'):
+                        tb_styles.append(img['border_css'])
+                    
+                    # 补充一些基础样式
+                    tb_styles.append('overflow: hidden') # 防止溢出
+                    
+                    tb_style_str = '; '.join(tb_styles)
                     tb_html = img.get('html', '')
-                    self.log_file.write(f"  生成文本框: style={tb_style}\n")
-                    html += f'<div style="{tb_style}">{tb_html}</div>'
+                    
+                    self.log_file.write(f"  生成独立文本框: style={tb_style_str}\n")
+                    html += f'<div style="{tb_style_str}">{tb_html}</div>'
+
+                elif img.get('type') == 'group':
+                    # 处理组合容器
+                    group_styles = []
+                    if img.get('width'):
+                        group_styles.append(f'width: {int(img["width"])}px')
+                    if img.get('height'):
+                        group_styles.append(f'height: {int(img["height"])}px')
+                    
+                    if img.get('wrap_style'):
+                        group_styles.append(img['wrap_style'])
+                    
+                    group_styles.append('position: relative')
+                    group_style_str = '; '.join(group_styles)
+                    
+                    html += f'<div style="{group_style_str}">'
+                    
+                    # 渲染叠加层
+                    for ov in img.get('overlays', []):
+                        ov_styles = ['position: absolute', 'z-index: 1']
+                        ov_styles.append(f'left: {int(ov.get("x", 0))}px')
+                        ov_styles.append(f'top: {int(ov.get("y", 0))}px')
+                        if ov.get('width'):
+                            ov_styles.append(f'width: {int(ov["width"])}px')
+                        if ov.get('height'):
+                            ov_styles.append(f'height: {int(ov["height"])}px')
+                        
+                        if ov.get('border_css'):
+                            ov_styles.append(ov['border_css'])
+                            
+                        ov_style_str = '; '.join(ov_styles)
+                        
+                        if ov.get('type') == 'image' and ov.get('filename'):
+                            oimg_path = f'./images/{ov["filename"]}'
+                            html += f'<img src="{oimg_path}" style="{ov_style_str}" alt="{ov["filename"]}" />'
+                        else:
+                            if ov.get('html'):
+                                html += f'<div style="{ov_style_str}">{ov["html"]}</div>'
+                            else:
+                                escaped_text = escape(ov.get('text', ''))
+                                html += f'<div style="{ov_style_str}">{escaped_text}</div>'
+                    
+                    html += '</div>'
+
                 else:
-                    # 处理图片
+                    # 处理图片 (及旧有的叠加逻辑，虽然现在应该都被group接管了，但保留以防万一)
                     img_style = []
                     if img['width']:
                         img_style.append(f'width: {int(img["width"])}px')
@@ -2107,7 +2346,9 @@ class DocxToHTMLConverter:
             
             # 添加段落文本（如果有）
             if has_text_content:
-                html += f'<div>{text_content}</div>'
+                # 尝试获取列表前缀
+                prefix_html = self._get_list_prefix_html(paragraph)
+                html += f'<div>{prefix_html}{text_content}</div>'
             
             html += '</div>'
             
@@ -2190,8 +2431,12 @@ class DocxToHTMLConverter:
                     bullet_style = '; '.join(bullet_styles)
                     prefix_html = f'<span style="{bullet_style}">{bullet_char}</span><span style="display:inline-block; width:{hanging_width}px;"></span>'
                 
-                # 生成唯一的标题ID
-                heading_id = self._generate_heading_id(text)
+                # 获取或生成标题ID
+                if paragraph._element in self.paragraph_ids:
+                    heading_id = self.paragraph_ids[paragraph._element]
+                else:
+                    # 如果预扫描未找到，则生成新ID
+                    heading_id = self._generate_heading_id(text)
                 
                 # 注册到标题映射
                 heading_text_clean = DocxUtils.strip_html_tags(text).strip()
@@ -2308,7 +2553,12 @@ class DocxToHTMLConverter:
                                 bullet_style = '; '.join(bullet_styles)
                                 prefix_html = f'<span style="{bullet_style}">{bullet_char}</span><span style="display:inline-block; width:{hanging_width}px;"></span>'
                             
-                            heading_id = self._generate_heading_id(text)
+                            # 获取或生成标题ID
+                            if paragraph._element in self.paragraph_ids:
+                                heading_id = self.paragraph_ids[paragraph._element]
+                            else:
+                                heading_id = self._generate_heading_id(text)
+                                
                             heading_text_clean = DocxUtils.strip_html_tags(text).strip()
                             self.headings_map[heading_text_clean] = heading_id
                             html = f'<p id="{heading_id}" style="{style}">{prefix_html}{text}</p>'
@@ -2426,17 +2676,20 @@ class DocxToHTMLConverter:
                     blip_elements = drawing.findall(f'.//{DocxUtils.A_NS}blip')
                     self.log_file.write(f"      Drawing {drawing_idx}: 找到 {len(blip_elements)} 个blip元素\n")
                     
-                    # 如果没有图片，检查是否为独立文本框或形状
+                        # 如果没有图片，检查是否为独立文本框或形状
                     if not blip_elements:
                         txbx_content = drawing.find(f'.//{DocxUtils.W_NS}txbxContent')
                         if txbx_content is not None:
                             self.log_file.write(f"      Drawing {drawing_idx}: 找到独立文本框，提取内容\n")
                             inner_html_parts = self._traverse_document_body(txbx_content)
                             inner_html = "".join(inner_html_parts)
+                            # 获取文本框的样式
+                            txbx_style = self._get_txbx_div_style(txbx_content)
                             if inner_html:
                                 pending_textboxes.append({
                                     'elem': drawing,
-                                    'html': inner_html
+                                    'html': inner_html,
+                                    'style': txbx_style
                                 })
                             continue
                         found_shape = None
@@ -2468,6 +2721,22 @@ class DocxToHTMLConverter:
                                         style_css = self._get_shape_style_css(spPr)
                             except Exception as e:
                                 self.log_file.write(f"      提取独立形状样式失败: {e}\n")
+
+                            # 过滤不可见的形状 (无HTML内容且样式表明不可见)
+                            # 只有当包含可见的边框或背景色时才保留
+                            is_visible = False
+                            if style_css:
+                                # 检查是否有可见边框 (包含 'border:' 且不是 'border: none')
+                                has_border = 'border:' in style_css and 'border: none' not in style_css
+                                # 检查是否有背景色
+                                has_bg = 'background-color:' in style_css
+                                
+                                if has_border or has_bg:
+                                    is_visible = True
+                            
+                            if not is_visible:
+                                self.log_file.write(f"      忽略不可见独立形状 (style='{style_css}')\n")
+                                continue
 
                             pending_textboxes.append({
                                 'elem': drawing,
@@ -2507,66 +2776,193 @@ class DocxToHTMLConverter:
         
         self.log_file.write(f"  段落图片提取完成，共 {len(images)} 个图片\n")
         
-        # 如同段存在多张图片，选取最大的一张作为底图，其余按锚点位置转为叠加图片
-        try:
-            base = None
-            max_area = -1
-            for it in images:
-                if it.get('type') == 'image' and it.get('width') and it.get('height'):
-                    area = it['width'] * it['height']
-                    if area > max_area:
-                        max_area = area
-                        base = it
-            if base is not None:
-                base_x, base_y = self._get_anchor_offsets(base.get('drawing_elem'))
-                # 收集需要转为叠加的图片
-                remaining = []
-                for it in images:
-                    if it is base:
-                        continue
-                    if it.get('type') == 'image':
-                        ox, oy = self._get_anchor_offsets(it.get('drawing_elem'))
-                        rel_x = int(ox - base_x)
-                        rel_y = int(oy - base_y)
-                        overlay = {
-                            'type': 'image',
-                            'filename': it.get('filename'),
-                            'x': rel_x,
-                            'y': rel_y,
-                            'width': it.get('width'),
-                            'height': it.get('height')
-                        }
-                        base['overlays'].append(overlay)
-                    else:
-                        remaining.append(it)
-                # 重建images列表，仅保留底图和非图片元素
-                images = [base] + remaining
+        # 合并所有图片和文本框，进行智能分组
+        all_items = []
+        # 添加图片
+        for img in images:
+            img['item_type'] = 'image'
+            # 确保有wrap_style
+            if 'wrap_style' not in img:
+                img['wrap_style'] = self._get_image_wrap_style(img['drawing_elem'])
+            all_items.append(img)
+            
+        # 添加文本框
+        for tb in pending_textboxes:
+            # 文本框需要构造类似的结构以便统一处理
+            # 尝试从xfrm提取宽高
+            tb_width = 0
+            tb_height = 0
+            spPr = None
+            if tb['elem'].find(f'.//{DocxUtils.WPS_NS}spPr') is not None:
+                spPr = tb['elem'].find(f'.//{DocxUtils.WPS_NS}spPr')
+            elif tb['elem'].find(f'.//{DocxUtils.A_NS}spPr') is not None:
+                spPr = tb['elem'].find(f'.//{DocxUtils.A_NS}spPr')
                 
-                # 将同段独立文本框统一附着到底图上（避免挂到非底图后被重组丢失）
-                if pending_textboxes:
-                    display_w = base.get('width') or 0
-                    display_h = base.get('height') or 0
-                    drawing_elem = base.get('drawing_elem')
-                    for tb in pending_textboxes:
-                        pos = self._get_textbox_position(tb['elem'], display_w, display_h, drawing_elem)
-                        overlay = {
-                            'type': 'text',
-                            'html': tb['html'],
-                            'x': int(pos.get('x', 0)),
-                            'y': int(pos.get('y', 0)),
-                            'width': int(pos.get('width')) if pos.get('width') else None,
-                            'height': int(pos.get('height')) if pos.get('height') else None
-                        }
-                        border_css = tb.get('border_css')
-                        if not border_css:
-                            border_css = self._get_shape_border_css(tb['elem'])
-                        if border_css:
-                            overlay['border_css'] = border_css
-                        base['overlays'].append(overlay)
-        except Exception:
-            pass
+            if spPr is not None:
+                xfrm = spPr.find(f'.//{DocxUtils.A_NS}xfrm')
+                if xfrm is not None:
+                    ext = xfrm.find(f'.//{DocxUtils.A_NS}ext')
+                    if ext is not None:
+                        cx = int(ext.get('cx') or 0)
+                        cy = int(ext.get('cy') or 0)
+                        tb_width = DocxUtils.emu_to_pixels(cx, apply_scale=True)
+                        tb_height = DocxUtils.emu_to_pixels(cy, apply_scale=True)
+            
+            # 获取wrap_style
+            wrap_style = self._get_image_wrap_style(tb['elem'])
+            
+            item = {
+                'item_type': 'textbox',
+                'html': tb['html'],
+                'border_css': tb.get('border_css'),
+                'drawing_elem': tb['elem'],
+                'width': tb_width,
+                'height': tb_height,
+                'wrap_style': wrap_style
+            }
+            all_items.append(item)
+
+        # 为所有元素计算绝对位置
+        for it in all_items:
+            elem = it.get('drawing_elem')
+            x, y = self._get_anchor_offsets(elem)
+            it['_abs_x'] = x
+            it['_abs_y'] = y
+            it['_rect'] = (x, y, it.get('width', 0) or 0, it.get('height', 0) or 0)
+
+        # 按照位置排序：先按y（容差10px），再按x
+        # 这样可以保证生成的HTML顺序符合视觉顺序（从上到下，从左到右）
+        def sort_key(item):
+            # 将y坐标分桶，每10px一行，避免微小抖动导致顺序错乱
+            y_bucket = item['_abs_y'] // 10
+            return (y_bucket, item['_abs_x'])
+            
+        all_items.sort(key=sort_key)
+
+        # 简单的重叠检测和分组
+        groups = []
+        processed = [False] * len(all_items)
+
+        for i in range(len(all_items)):
+            if processed[i]:
+                continue
+            
+            # 新建组
+            current_group = [all_items[i]]
+            processed[i] = True
+            
+            # 检查后续元素是否与当前组重叠
+            # 这是一个简化的贪心策略，可能无法处理复杂的传递性重叠，但对文档排版通常足够
+            group_changed = True
+            while group_changed:
+                group_changed = False
+                # 计算当前组的包围盒
+                min_x = min(it['_rect'][0] for it in current_group)
+                min_y = min(it['_rect'][1] for it in current_group)
+                max_x = max(it['_rect'][0] + it['_rect'][2] for it in current_group)
+                max_y = max(it['_rect'][1] + it['_rect'][3] for it in current_group)
+                
+                for j in range(len(all_items)):
+                    if not processed[j]:
+                        # 检查是否重叠
+                        r = all_items[j]['_rect']
+                        # 宽松一点的重叠检测（允许一点点间隙或误差，比如5px）
+                        margin = 5
+                        
+                        # 矩形重叠条件：不(A在B左 or A在B右 or A在B上 or A在B下)
+                        # r: (x, y, w, h) -> (left, top, width, height)
+                        item_left = r[0]
+                        item_right = r[0] + r[2]
+                        item_top = r[1]
+                        item_bottom = r[1] + r[3]
+                        
+                        is_overlapping = not (
+                            item_right + margin < min_x or  # Item在Group左边
+                            item_left > max_x + margin or   # Item在Group右边
+                            item_bottom + margin < min_y or # Item在Group上边
+                            item_top > max_y + margin       # Item在Group下边
+                        )
+                        
+                        if is_overlapping:
+                            current_group.append(all_items[j])
+                            processed[j] = True
+                            group_changed = True
+                            # 重新计算包围盒（在下一次循环）
+                            break
+            
+            groups.append(current_group)
+
+        # 构建最终结果列表
+        final_results = []
+        for group in groups:
+            if len(group) == 1:
+                # 单个元素，直接返回
+                it = group[0]
+                if it['item_type'] == 'image':
+                    final_results.append(it)
+                else:
+                    final_results.append({
+                        'type': 'textbox',
+                        'html': it['html'],
+                        'style': '', 
+                        'border_css': it.get('border_css', ''),
+                        'width': it.get('width'),
+                        'height': it.get('height'),
+                        'wrap_style': it.get('wrap_style')
+                    })
+            else:
+                # 组合元素
+                # 计算组包围盒
+                min_x = min(it['_abs_x'] for it in group)
+                min_y = min(it['_abs_y'] for it in group)
+                max_x = max(it['_abs_x'] + (it.get('width', 0) or 0) for it in group)
+                max_y = max(it['_abs_y'] + (it.get('height', 0) or 0) for it in group)
+                
+                container_w = max_x - min_x
+                container_h = max_y - min_y
+                
+                # 优先使用组内最大的图片的wrap_style，或者第一个元素的
+                wrap_style = group[0].get('wrap_style', '')
+                max_area = -1
+                for it in group:
+                    if it['item_type'] == 'image':
+                        area = (it.get('width', 0) or 0) * (it.get('height', 0) or 0)
+                        if area > max_area:
+                            max_area = area
+                            wrap_style = it.get('wrap_style', '')
+                
+                container = {
+                    'type': 'group',
+                    'width': container_w,
+                    'height': container_h,
+                    'overlays': [],
+                    'wrap_style': wrap_style
+                }
+                
+                for it in group:
+                    rel_x = it['_abs_x'] - min_x
+                    rel_y = it['_abs_y'] - min_y
+                    
+                    overlay = {
+                        'x': int(rel_x),
+                        'y': int(rel_y),
+                        'width': it['width'],
+                        'height': it['height']
+                    }
+                    
+                    if it['item_type'] == 'image':
+                        overlay['type'] = 'image'
+                        overlay['filename'] = it['filename']
+                    elif it['item_type'] == 'textbox':
+                        overlay['type'] = 'text'
+                        overlay['html'] = it['html']
+                        overlay['border_css'] = it.get('border_css')
+                        
+                    container['overlays'].append(overlay)
+                
+                final_results.append(container)
         
-        return images
+        return final_results
     
     def _get_anchor_offsets(self, drawing_elem):
         """获取drawing的锚点绝对位置（页面坐标，像素，已按页面缩放）"""
@@ -2776,8 +3172,99 @@ class DocxToHTMLConverter:
         return html
     
 
+    def _scan_toc_recursive(self, element):
+        """递归扫描文档中的目录条目"""
+        from docx.text.paragraph import Paragraph
+        
+        for child in element:
+            if child.tag == DocxUtils.W_NS + 'p':
+                try:
+                    paragraph = Paragraph(child, self.doc)
+                    is_toc, toc_title, _ = self._is_toc_paragraph(paragraph)
+                    if is_toc and toc_title:
+                        self.toc_titles.add(toc_title.strip())
+                except Exception:
+                    pass
+            elif child.tag == DocxUtils.W_NS + 'tbl':
+                for row in child.findall(f'.//{DocxUtils.W_NS}tr'):
+                    for cell in row.findall(f'.//{DocxUtils.W_NS}tc'):
+                        self._scan_toc_recursive(cell)
+            elif child.tag == DocxUtils.W_NS + 'txbxContent':
+                self._scan_toc_recursive(child)
+            elif len(child) > 0:
+                self._scan_toc_recursive(child)
+
+    def _scan_headings_recursive(self, element):
+        """递归扫描文档中的标题，预先生成ID"""
+        from docx.text.paragraph import Paragraph
+        
+        for child in element:
+            if child.tag == DocxUtils.W_NS + 'p':
+                # 创建段落对象
+                try:
+                    paragraph = Paragraph(child, self.doc)
+                    
+                    # 跳过目录段落，避免将其识别为标题
+                    is_toc, _, _ = self._is_toc_paragraph(paragraph)
+                    if is_toc:
+                        continue
+                        
+                    is_heading = self.is_heading_from_xml(paragraph)
+                    
+                    if not is_heading:
+                        # 尝试匹配目录
+                        text_plain = DocxUtils.strip_html_tags(self.extract_paragraph_text_with_links(paragraph)).strip()
+                        if self._matches_toc_title(text_plain):
+                            is_heading = True
+                    
+                    if is_heading:
+                        text = self.extract_paragraph_text_with_links(paragraph)
+                        # 生成ID
+                        heading_id = self._generate_heading_id(text)
+                        
+                        # 注册到标题映射
+                        heading_text_clean = DocxUtils.strip_html_tags(text).strip()
+                        if heading_text_clean:
+                            self.headings_map[heading_text_clean] = heading_id
+                        
+                        # 存储ID供后续使用
+                        self.paragraph_ids[child] = heading_id
+                except Exception:
+                    pass
+                    
+            elif child.tag == DocxUtils.W_NS + 'tbl':
+                # 递归扫描表格
+                for row in child.findall(f'.//{DocxUtils.W_NS}tr'):
+                    for cell in row.findall(f'.//{DocxUtils.W_NS}tc'):
+                        self._scan_headings_recursive(cell)
+                        
+            elif child.tag == DocxUtils.W_NS + 'txbxContent':
+                # 递归扫描文本框
+                self._scan_headings_recursive(child)
+                
+            elif len(child) > 0:
+                # 递归扫描其他复合元素
+                self._scan_headings_recursive(child)
+
     def convert(self):
         """转换DOCX为HTML"""
+        # 第一遍扫描：预生成标题ID
+        self.log_file.write(f"\n{'='*80}\n")
+        self.log_file.write(f"预扫描标题...\n")
+        self.log_file.write(f"{'='*80}\n")
+        try:
+            body = self.doc.part.element.body
+            
+            # 1. 先扫描目录条目
+            self._scan_toc_recursive(body)
+            self.log_file.write(f"预扫描完成，发现 {len(self.toc_titles)} 个目录条目\n")
+            
+            # 2. 再扫描标题（包括匹配目录的标题）
+            self._scan_headings_recursive(body)
+            self.log_file.write(f"预扫描完成，发现 {len(self.paragraph_ids)} 个标题\n")
+        except Exception as e:
+            self.log_file.write(f"预扫描标题失败: {e}\n")
+
         html_parts = []
         
         # HTML头部
