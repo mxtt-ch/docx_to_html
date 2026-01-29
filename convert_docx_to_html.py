@@ -86,6 +86,8 @@ class DocxToHTMLConverter:
         self._load_table_styles()
 
         # 初始化缩放因子，使内容区宽度映射到1200px
+        self.page_left_margin = 0
+        self.page_top_margin = 0
         try:
             self._init_scale_to_1200()
         except Exception as e:
@@ -101,6 +103,12 @@ class DocxToHTMLConverter:
             page_w = getattr(section, 'page_width', None)
             left_m = getattr(section, 'left_margin', None)
             right_m = getattr(section, 'right_margin', None)
+            top_m = getattr(section, 'top_margin', None)
+            
+            # 保存页边距用于定位计算
+            self.page_left_margin = int(left_m) if left_m is not None else 0
+            self.page_top_margin = int(top_m) if top_m is not None else 0
+            
             content_emu = int(page_w) - int(left_m) - int(right_m) if page_w and left_m is not None and right_m is not None else None
             if content_emu and content_emu > 0:
                 content_px = emu_to_px_no_scale(int(content_emu))
@@ -190,7 +198,7 @@ class DocxToHTMLConverter:
                                     
                                     # 判断是编号还是项目符号
                                     is_bullet = False
-                                    bullet_char = '•'
+                                    bullet_char = None
                                     numFmt = None
                                     
                                     # 检查编号格式
@@ -204,14 +212,18 @@ class DocxToHTMLConverter:
                                     buChar = lvl.find(f'{DocxUtils.W_NS}buChar')
                                     buAutoNum = lvl.find(f'{DocxUtils.W_NS}buAutoNum')
                                     buBlip = lvl.find(f'{DocxUtils.W_NS}buBlip')
+                                    lvlText = lvl.find(f'{DocxUtils.W_NS}lvlText')
                                     
-                                    if buChar is not None or buAutoNum is not None or buBlip is not None:
+                                    if buChar is not None or buAutoNum is not None or buBlip is not None or (is_bullet and lvlText is not None):
                                         is_bullet = True
                                         if buChar is not None:
-                                            bullet_char = buChar.get(f'{DocxUtils.W_NS}char', '•')
+                                            bullet_char = buChar.get(f'{DocxUtils.W_NS}char')
+                                        elif lvlText is not None:
+                                            bullet_char = lvlText.get(f'{DocxUtils.W_NS}val')
                                     
-                                    # 获取列表标记颜色
+                                    # 获取列表标记颜色和字体
                                     bullet_color = None
+                                    bullet_font_family = None
                                     lvl_rPr = lvl.find(f'{DocxUtils.W_NS}rPr')
                                     if lvl_rPr is not None:
                                         color = lvl_rPr.find(f'{DocxUtils.W_NS}color')
@@ -219,6 +231,17 @@ class DocxToHTMLConverter:
                                             color_val = color.get(f'{DocxUtils.W_NS}val')
                                             if color_val and len(color_val) == 6:
                                                 bullet_color = f"#{color_val}"
+                                        
+                                        # 获取字体
+                                        rFonts = lvl_rPr.find(f'{DocxUtils.W_NS}rFonts')
+                                        if rFonts is not None:
+                                            # 优先使用 ascii 或 hAnsi，通常符号字体在这里
+                                            ascii_font = rFonts.get(f'{DocxUtils.W_NS}ascii')
+                                            hAnsi_font = rFonts.get(f'{DocxUtils.W_NS}hAnsi')
+                                            if ascii_font:
+                                                bullet_font_family = ascii_font
+                                            elif hAnsi_font:
+                                                bullet_font_family = hAnsi_font
                                     
                                     # 获取列表标记字体大小
                                     bullet_size = None
@@ -234,7 +257,8 @@ class DocxToHTMLConverter:
                                         'bullet_char': bullet_char,
                                         'numFmt': numFmt,
                                         'bullet_color': bullet_color,
-                                        'bullet_size': bullet_size
+                                        'bullet_size': bullet_size,
+                                        'bullet_font_family': bullet_font_family
                                     }
                                 
                                 numbering_defs[numId] = levels
@@ -663,51 +687,126 @@ class DocxToHTMLConverter:
         
         return False, None, None
     
-    def _should_merge_paragraphs(self, p1, p2):
-        """判断两个段落是否应该合并（用于处理连续的浮动图片/文本框）"""
+    def _has_body_text(self, paragraph_elem):
+        """
+        检查段落是否包含实质性的正文文本（忽略drawing/pict内部的文本）
+        
+        Args:
+            paragraph_elem: 段落XML元素
+            
+        Returns:
+            bool: 是否包含正文文本
+        """
         try:
-            # 检查p1是否包含浮动drawing
-            has_float1 = False
-            for drawing in p1.findall(f'.//{DocxUtils.W_NS}drawing'):
-                if drawing.find(f'.//{DocxUtils.WP_NS}anchor') is not None:
-                    has_float1 = True
-                    break
-            
-            if not has_float1:
-                return False
-                
-            # 检查p2是否包含浮动drawing
-            has_float2 = False
-            for drawing in p2.findall(f'.//{DocxUtils.W_NS}drawing'):
-                if drawing.find(f'.//{DocxUtils.WP_NS}anchor') is not None:
-                    has_float2 = True
-                    break
-                    
-            if not has_float2:
-                return False
-            
-            # 检查p2是否有直接的文本内容（不包含drawing内的文本）
-            # 如果p2有直接文本（如标题、说明文字），则不应合并，应保留为独立段落
-            has_direct_text = False
-            for r in p2.findall(f'{DocxUtils.W_NS}r'):
-                for t in r.findall(f'{DocxUtils.W_NS}t'):
+            # 遍历所有 run
+            for run in paragraph_elem.findall(f'{DocxUtils.W_NS}r'):
+                # 检查 run 中是否有文本节点
+                texts = run.findall(f'{DocxUtils.W_NS}t')
+                for t in texts:
                     if t.text and t.text.strip():
-                        has_direct_text = True
-                        break
-                if has_direct_text:
-                    break
-            
-            if has_direct_text:
-                return False
-            
-            return True
+                        return True
+            return False
         except Exception:
             return False
 
-    def _merge_paragraph_elements(self, target_p, source_p):
-        """将source_p的内容合并到target_p"""
-        for run in source_p.findall(f'{DocxUtils.W_NS}r'):
-            target_p.append(run)
+    def _analyze_paragraph_relationship(self, p1, p2):
+        """
+        分析两个段落之间的关系
+        
+        区分两种主要模式：
+        1. MERGE (合并/覆盖): p1是底图，p2是叠加在上面的文本框、标注、形状等。p2通常无正文文本。
+        2. MIXED (混排/环绕): p1是浮动元素，p2是环绕在周围的文本。p2必须有实质性正文文本。
+        
+        Returns:
+            str: 'MERGE' (合并), 'MIXED' (混排), 'NONE' (无关系)
+        """
+        try:
+            # 1. 获取p1和p2的浮动元素信息
+            floats1 = self._get_paragraph_floats_info(p1)
+            
+            # 如果p1没有浮动元素，通常不进行合并或混排处理
+            if not floats1:
+                return 'NONE'
+                
+            floats2 = self._get_paragraph_floats_info(p2)
+            has_text2 = self._has_body_text(p2)
+            
+            # 2. 判断逻辑
+            
+            # 情况A: p2包含实质性正文文本 -> 判定为混排 (MIXED)
+            # 只要有文本，就认为是文本环绕图片（或者是图文混排）
+            if has_text2:
+                return 'MIXED'
+            
+            # 情况B: p2无正文文本，但有浮动元素 -> 判定为合并 (MERGE)
+            # 这种通常是图片上叠加了文本框、标注、形状等
+            # 需要检查位置是否重叠，或者是否紧密相关
+            if floats2:
+                # 检查垂直位置是否重叠
+                min_y1 = min(f['y'] for f in floats1)
+                max_y1 = max(f['y'] + f['h'] for f in floats1)
+                
+                min_y2 = min(f['y'] for f in floats2)
+                max_y2 = max(f['y'] + f['h'] for f in floats2)
+                
+                # 计算重叠
+                overlap_start = max(min_y1, min_y2)
+                overlap_end = min(max_y1, max_y2)
+                
+                # 只要有任何重叠，或者是包含关系，就认为是MERGE
+                if overlap_end > overlap_start:
+                    return 'MERGE'
+                
+                # 特殊情况：如果两者非常接近（例如<100px），也可以视为MERGE
+                # 比如标注就在图片正下方
+                if abs(min_y2 - max_y1) < 100 * 914400 / 96: # 100px
+                     return 'MERGE'
+                     
+                return 'NONE'
+            
+            # 情况C: p2既无文本也无浮动 -> 空段落
+            return 'NONE'
+                
+        except Exception as e:
+            self.log_file.write(f"分析段落关系出错: {e}\n")
+            return 'NONE'
+
+    def _get_paragraph_floats_info(self, paragraph_elem):
+        """
+        获取段落中所有浮动元素的位置信息
+        
+        Returns:
+            list: [{'y': int, 'h': int}, ...] (单位EMU)
+        """
+        floats = []
+        for drawing in paragraph_elem.findall(f'.//{DocxUtils.W_NS}drawing'):
+            anchor = drawing.find(f'.//{DocxUtils.WP_NS}anchor')
+            if anchor is not None:
+                # 获取垂直位置
+                position_v = anchor.find(f'{DocxUtils.WP_NS}positionV')
+                y = 0
+                if position_v is not None:
+                    # 优先看 posOffset
+                    pos_offset = position_v.find(f'{DocxUtils.WP_NS}posOffset')
+                    if pos_offset is not None and pos_offset.text:
+                        y = int(pos_offset.text)
+                    # 如果是 align，则难以确定具体y值，暂设为0或忽略
+                
+                # 获取高度
+                extent = anchor.find(f'{DocxUtils.WP_NS}extent')
+                h = 0
+                if extent is not None:
+                    cy = extent.get('cy')
+                    if cy:
+                        h = int(cy)
+                
+                floats.append({'y': y, 'h': h})
+        return floats
+
+    def _make_temp_paragraph(self, elem):
+        """创建一个临时Paragraph对象用于提取文本"""
+        from docx.text.paragraph import Paragraph
+        return Paragraph(elem, self.doc)
 
     def _traverse_document_body(self, body_element, table_context=None, progress=None):
         """
@@ -743,13 +842,41 @@ class DocxToHTMLConverter:
             if elem.tag == DocxUtils.W_NS + 'p':
                 self.log_file.write(f"  -> 发现段落元素\n")
                 
-                # 尝试合并后续连续的浮动段落
+                # 识别段落组（处理合并和混排）
+                group_elements = [elem]
                 next_idx = i + 1
+                is_mixed_group = False
+                
                 while next_idx < total_len:
                     next_elem = body_element[next_idx]
-                    if next_elem.tag == DocxUtils.W_NS + 'p' and self._should_merge_paragraphs(elem, next_elem):
-                        self.log_file.write(f"  -> 合并后续浮动段落: {next_idx}\n")
-                        self._merge_paragraph_elements(elem, next_elem)
+                    
+                    # 只处理连续的段落
+                    if next_elem.tag != DocxUtils.W_NS + 'p':
+                        break
+                    
+                    # 分析段落关系
+                    # 优先检查与组内第一个元素（通常是锚点/图片）的关系
+                    relation = self._analyze_paragraph_relationship(group_elements[0], next_elem)
+                    
+                    should_group = False
+                    if relation in ['MERGE', 'MIXED']:
+                        should_group = True
+                        if relation == 'MIXED':
+                            is_mixed_group = True
+                        self.log_file.write(f"  -> 发现关联段落 ({relation}): {next_idx} (与首段关联)\n")
+                    else:
+                        # 如果与首段无直接关系，检查与前一个段落的关系（链式关联）
+                        # 例如：图片 -> 图片(MERGE) -> 文本(MIXED)
+                        if len(group_elements) > 1:
+                            rel_adjacent = self._analyze_paragraph_relationship(group_elements[-1], next_elem)
+                            if rel_adjacent in ['MERGE', 'MIXED']:
+                                should_group = True
+                                if rel_adjacent == 'MIXED':
+                                    is_mixed_group = True
+                                self.log_file.write(f"  -> 发现关联段落 ({rel_adjacent}): {next_idx} (与前段关联)\n")
+                    
+                    if should_group:
+                        group_elements.append(next_elem)
                         # 更新进度条，因为我们跳过了一个元素
                         if progress is not None:
                             try:
@@ -764,8 +891,19 @@ class DocxToHTMLConverter:
                 i = next_idx
                 
                 from docx.text.paragraph import Paragraph
-                para = Paragraph(elem, self.doc)
-                html_parts.append(self.process_paragraph(para, table_context=table_context))
+                
+                # 渲染段落
+                if len(group_elements) > 1:
+                    html_parts.append(f'<div style="position: relative; overflow: hidden;">')
+                    for p_elem in group_elements:
+                        para = Paragraph(p_elem, self.doc)
+                        html_parts.append(self.process_paragraph(para, table_context=table_context, in_mixed_group=is_mixed_group))
+                    html_parts.append('</div>')
+                    self.log_file.write(f"  -> 渲染段落组: {len(group_elements)} 个段落 (Mixed={is_mixed_group})\n")
+                else:
+                    # 单个段落处理
+                    para = Paragraph(elem, self.doc)
+                    html_parts.append(self.process_paragraph(para, table_context=table_context))
             
             # 处理表格 <w:tbl>
             elif elem.tag == DocxUtils.W_NS + 'tbl':
@@ -817,6 +955,16 @@ class DocxToHTMLConverter:
         """
         html_parts = []
         
+        # 字段代码状态追踪
+        field_state = {
+            'in_field': False,
+            'field_type': None,
+            'instr_text': [],
+            'url': None,
+            'ready_for_content': False,
+            'captured_content': []
+        }
+        
         for run_idx, run in enumerate(paragraph.runs):
             # 获取run的样式
             style = self._get_run_format_from_xml(run)
@@ -827,23 +975,47 @@ class DocxToHTMLConverter:
             
             # 遍历run的所有子元素，分别处理文本和其他元素
             text_buffer = []
-            self._process_run_elements(run._element, text_buffer, is_hyperlink, style, html_parts)
+            self._process_run_elements(run._element, text_buffer, is_hyperlink, style, html_parts, field_state)
             
             # 处理缓冲区中剩余的文本
-            if text_buffer:
-                combined_text = ''.join(text_buffer)
-                if combined_text.strip():
-                    if is_hyperlink:
-                        self._process_hyperlink(hyperlink_elem, combined_text, style, html_parts)
-                    else:
-                        escaped_text = escape(combined_text)
-                        html_parts.append(f'<span style="{style}">{escaped_text}</span>')
+            self._flush_run_text_buffer(text_buffer, is_hyperlink, style, html_parts, field_state, hyperlink_elem)
         
         return "".join(html_parts)
+
+    def _flush_run_text_buffer(self, text_buffer, is_hyperlink, style, html_parts, field_state, hyperlink_elem=None):
+        """辅助方法：处理文本缓冲区"""
+        if not text_buffer:
+            return
+            
+        combined_text = ''.join(text_buffer)
+        if not combined_text.strip():
+            text_buffer.clear()
+            return
+            
+        # 确定目标列表
+        target_list = html_parts
+        if field_state['ready_for_content'] and field_state['field_type'] == 'HYPERLINK':
+            target_list = field_state['captured_content']
+            
+        if is_hyperlink:
+            self._process_hyperlink(hyperlink_elem, combined_text, style, target_list)
+        else:
+            escaped_text = escape(combined_text)
+            if style:
+                target_list.append(f'<span style="{style}">{escaped_text}</span>')
+            else:
+                target_list.append(f'<span>{escaped_text}</span>')
+            
+        text_buffer.clear()
     
-    def _process_run_elements(self, run_element, text_buffer, is_hyperlink, style, html_parts):
+    def _process_run_elements(self, run_element, text_buffer, is_hyperlink, style, html_parts, field_state):
         """处理run内的所有元素，区分文本和格式元素"""
         for child in run_element:
+            # 确定目标列表 (用于非文本元素)
+            target_list = html_parts
+            if field_state['ready_for_content'] and field_state['field_type'] == 'HYPERLINK':
+                target_list = field_state['captured_content']
+                
             # 文本元素
             if child.tag == DocxUtils.W_NS + 't':
                 text = child.text or ''
@@ -851,19 +1023,15 @@ class DocxToHTMLConverter:
                 hyperlink_parent = self._find_parent_with_tag(child, [DocxUtils.W_NS + 'hyperlink'])
                 if hyperlink_parent is not None:
                     # 将缓冲区先输出
-                    if text_buffer:
-                        combined_text = ''.join(text_buffer)
-                        if combined_text.strip():
-                            escaped_text = escape(combined_text)
-                            html_parts.append(f'<span style="{style}">{escaped_text}</span>')
-                        text_buffer.clear()
+                    self._flush_run_text_buffer(text_buffer, is_hyperlink, style, html_parts, field_state)
+                    
                     # 输出超链接文本
                     rId = hyperlink_parent.get(f'{DocxUtils.R_NS}id')
                     anchor = hyperlink_parent.get(f'{DocxUtils.W_NS}anchor')
                     link_text = text
                     if link_text.strip():
                         fake_run_style = style
-                        self._process_hyperlink(hyperlink_parent, link_text, fake_run_style, html_parts)
+                        self._process_hyperlink(hyperlink_parent, link_text, fake_run_style, target_list)
                     continue
                 # 检查文本是否为点号或句号
                 if text in ['.', '。', '、', '，']:
@@ -875,34 +1043,21 @@ class DocxToHTMLConverter:
             # 换行符 - 立即添加真实的HTML换行标签，不放入文本缓冲区
             elif child.tag == DocxUtils.W_NS + 'br':
                 # 先处理缓冲区中的文本
-                if text_buffer:
-                    combined_text = ''.join(text_buffer)
-                    if combined_text.strip():
-                        if is_hyperlink:
-                            self._process_hyperlink(None, combined_text, style, html_parts)
-                        else:
-                            escaped_text = escape(combined_text)
-                            html_parts.append(f'<span style="{style}">{escaped_text}</span>')
-                    text_buffer.clear()
+                self._flush_run_text_buffer(text_buffer, is_hyperlink, style, html_parts, field_state)
                 
                 # 添加换行标签（不带任何额外内容）
-                html_parts.append('<br>')
+                target_list.append('<br>')
             
             # 制表符 - 转换为HTML实体，但先处理缓冲区文本
             elif child.tag == DocxUtils.W_NS + 'tab':
                 # 先处理缓冲区中的文本
-                if text_buffer:
-                    combined_text = ''.join(text_buffer)
-                    if combined_text.strip():
-                        if is_hyperlink:
-                            self._process_hyperlink(None, combined_text, style, html_parts)
-                        else:
-                            escaped_text = escape(combined_text)
-                            html_parts.append(f'<span style="{style}">{escaped_text}</span>')
-                    text_buffer.clear()
+                self._flush_run_text_buffer(text_buffer, is_hyperlink, style, html_parts, field_state)
                 
                 # 添加制表符（使用CSS方式实现）
-                html_parts.append(f'<span style="{style}">&emsp;&emsp;</span>')
+                if style:
+                    target_list.append(f'<span style="{style}">&emsp;&emsp;</span>')
+                else:
+                    target_list.append('<span>&emsp;&emsp;</span>')
             
             # 符号 - 立即处理
             elif child.tag == DocxUtils.W_NS + 'sym':
@@ -910,28 +1065,87 @@ class DocxToHTMLConverter:
                 char = child.get(f'{DocxUtils.W_NS}char')
                 if char:
                     # 先处理缓冲区中的文本
-                    if text_buffer:
-                        combined_text = ''.join(text_buffer)
-                        if combined_text.strip():
-                            if is_hyperlink:
-                                self._process_hyperlink(None, combined_text, style, html_parts)
-                            else:
-                                escaped_text = escape(combined_text)
-                                html_parts.append(f'<span style="{style}">{escaped_text}</span>')
-                        text_buffer.clear()
+                    self._flush_run_text_buffer(text_buffer, is_hyperlink, style, html_parts, field_state)
+                    
+                    # 为符号添加专门的字体样式
+                    symbol_style = style
+                    if font:
+                        # 保留符号的字体，添加到样式中
+                        symbol_style = f"font-family: '{font}'; {symbol_style}"
                     
                     # 添加符号
-                    html_parts.append(f'<span style="{style}">&#x{char};</span>')
+                    if symbol_style:
+                        target_list.append(f'<span style="{symbol_style}">&#x{char};</span>')
+                    else:
+                        target_list.append(f'<span>&#x{char};</span>')
             
-            # 字段分隔符 - 忽略
+            # 字段代码处理
             elif child.tag == DocxUtils.W_NS + 'fldChar':
-                pass
+                fldCharType = child.get(f'{DocxUtils.W_NS}fldCharType')
+                if fldCharType == 'begin':
+                    field_state['in_field'] = True
+                    field_state['instr_text'] = []
+                    field_state['url'] = None
+                    field_state['ready_for_content'] = False
+                    field_state['captured_content'] = []
+                    field_state['field_type'] = None
+                    # 先处理缓冲区中的文本
+                    self._flush_run_text_buffer(text_buffer, is_hyperlink, style, html_parts, field_state)
+                    
+                elif fldCharType == 'separate':
+                    # Parse instruction
+                    instr = "".join(field_state['instr_text'])
+                    if 'HYPERLINK' in instr:
+                        field_state['field_type'] = 'HYPERLINK'
+                        # Extract URL using regex
+                        # HYPERLINK "url"
+                        # 可能包含引号，也可能没有
+                        m = re.search(r'HYPERLINK\s+(?:\\"|")?([^"\\]+)(?:\\"|")?', instr)
+                        if not m:
+                             m = re.search(r'HYPERLINK\s+([^\s]+)', instr)
+                        
+                        if m:
+                            field_state['url'] = m.group(1)
+                            self.log_file.write(f"  识别到字段超链接: {field_state['url']}\n")
+                        
+                        field_state['ready_for_content'] = True
+                    else:
+                        field_state['field_type'] = 'OTHER'
+                        field_state['ready_for_content'] = False
+                    
+                    # 先处理缓冲区中的文本
+                    self._flush_run_text_buffer(text_buffer, is_hyperlink, style, html_parts, field_state)
+                        
+                elif fldCharType == 'end':
+                    # 先处理缓冲区中的文本
+                    self._flush_run_text_buffer(text_buffer, is_hyperlink, style, html_parts, field_state)
+                    
+                    if field_state['field_type'] == 'HYPERLINK' and field_state['url']:
+                        # Flush captured content wrapped in <a>
+                        content = "".join(field_state['captured_content'])
+                        if content.strip():
+                            escaped_href = escape(field_state['url'])
+                            # 使用captured content，它已经包含了带样式的spans
+                            html_parts.append(f'<a href="{escaped_href}">{content}</a>')
+                    
+                    # Reset
+                    field_state['in_field'] = False
+                    field_state['field_type'] = None
+                    field_state['ready_for_content'] = False
+                    field_state['captured_content'] = []
+            
+            elif child.tag == DocxUtils.W_NS + 'instrText':
+                if field_state['in_field']:
+                    field_state['instr_text'].append(child.text or '')
     
     def _process_hyperlink(self, hyperlink_elem, text, style, html_parts):
         """处理超链接"""
         if not hyperlink_elem:
             escaped_text = escape(text)
-            html_parts.append(f'<span style="{style}">{escaped_text}</span>')
+            if style:
+                html_parts.append(f'<span style="{style}">{escaped_text}</span>')
+            else:
+                html_parts.append(f'<span>{escaped_text}</span>')
             return
             
         rId = hyperlink_elem.get(f'{DocxUtils.R_NS}id')
@@ -957,14 +1171,23 @@ class DocxToHTMLConverter:
                     if href:
                         escaped_text = escape(text)
                         escaped_href = escape(href)
-                        html_parts.append(f'<a href="{escaped_href}" style="{style}">{escaped_text}</a>')
+                        if style:
+                            html_parts.append(f'<a href="{escaped_href}" style="{style}">{escaped_text}</a>')
+                        else:
+                            html_parts.append(f'<a href="{escaped_href}">{escaped_text}</a>')
                     else:
                         escaped_text = escape(text)
-                        html_parts.append(f'<span style="{style}">{escaped_text}</span>')
+                        if style:
+                            html_parts.append(f'<span style="{style}">{escaped_text}</span>')
+                        else:
+                            html_parts.append(f'<span>{escaped_text}</span>')
                     break
         else:
             escaped_text = escape(text)
-            html_parts.append(f'<span style="{style}">{escaped_text}</span>')
+            if style:
+                html_parts.append(f'<span style="{style}">{escaped_text}</span>')
+            else:
+                html_parts.append(f'<span>{escaped_text}</span>')
     
     def _get_run_format_from_xml(self, run):
         """从XML中获取run格式（合并直接格式和样式）"""
@@ -1176,13 +1399,13 @@ class DocxToHTMLConverter:
         从XML中解析列表信息
         
         Returns:
-            tuple: (list_type, level, list_id, list_color, numFmt, bullet_size)
+            tuple: (list_type, level, list_id, list_color, numFmt, bullet_size, bullet_font_family)
             - numbered: bullet_size为None，numFmt为编号格式
             - bulleted: numFmt为None，bullet_size为项目符号字号（pt）
         """
         pPr = paragraph._element.pPr
         if pPr is None:
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, None
         
         # 检查编号列表（段落自身）
         numPr = pPr.find(qn('w:numPr'))
@@ -1203,17 +1426,18 @@ class DocxToHTMLConverter:
                     numFmt = level_info.get('numFmt')
                     bullet_color = level_info.get('bullet_color')
                     bullet_size = level_info.get('bullet_size')
+                    bullet_font_family = level_info.get('bullet_font_family')
                     
                     paragraph_color = self._get_list_number_color_from_xml(paragraph)
                     
                     if is_bullet:
-                        return 'bulleted', ilvl, bullet_char, bullet_color or paragraph_color, None, bullet_size
+                        return 'bulleted', ilvl, bullet_char, bullet_color or paragraph_color, None, bullet_size, bullet_font_family
                     else:
-                        return 'numbered', ilvl, numId, paragraph_color, numFmt, None
+                        return 'numbered', ilvl, numId, paragraph_color, numFmt, None, None
             
             # 默认为编号列表
             list_color = self._get_list_number_color_from_xml(paragraph)
-            return 'numbered', ilvl, numId, list_color, None, None
+            return 'numbered', ilvl, numId, list_color, None, None, None
         
         # 若段落未显式设置numPr，尝试从样式继承链获取
         try:
@@ -1247,29 +1471,30 @@ class DocxToHTMLConverter:
                                     numFmt = level_info.get('numFmt')
                                     bullet_color = level_info.get('bullet_color')
                                     bullet_size = level_info.get('bullet_size')
+                                    bullet_font_family = level_info.get('bullet_font_family')
                                     
                                     paragraph_color = self._get_list_number_color_from_xml(paragraph)
                                     
                                     if is_bullet:
-                                        return 'bulleted', ilvl, bullet_char, bullet_color or paragraph_color, None, bullet_size
+                                        return 'bulleted', ilvl, bullet_char, bullet_color or paragraph_color, None, bullet_size, bullet_font_family
                                     else:
-                                        return 'numbered', ilvl, numId, paragraph_color, numFmt, None
+                                        return 'numbered', ilvl, numId, paragraph_color, numFmt, None, None
                             # 找到样式级numPr但未能映射定义，直接返回编号默认值
                             list_color = self._get_list_number_color_from_xml(paragraph)
-                            return 'numbered', ilvl, numId, list_color, None, None
+                            return 'numbered', ilvl, numId, list_color, None, None, None
         except Exception:
             pass
         
         # 检查项目符号
         buChar = pPr.find(qn('w:buChar'))
         if buChar is not None:
-            bullet_char = buChar.get(qn('w:char'), '•')
+            bullet_char = buChar.get(qn('w:char'))
             ilvl_elem = pPr.find(qn('w:ilvl'))
             ilvl = int(ilvl_elem.get(qn('w:val'))) if ilvl_elem is not None else 0
             list_color = self._get_list_number_color_from_xml(paragraph)
-            return 'bulleted', ilvl, bullet_char, list_color, None, None
+            return 'bulleted', ilvl, bullet_char, list_color, None, None, None
         
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
     
     def _matches_toc_title(self, text_plain):
         """判断纯文本是否匹配已记录的目录标题（宽松匹配）"""
@@ -1884,7 +2109,7 @@ class DocxToHTMLConverter:
             scale_y = img_height / original_img_height if original_img_height > 0 else 1
             
             # 情况1：textbox_elem 本身是一个独立的 w:drawing（与底图属于不同drawing）
-            # 这种情况用于段落中的“独立文本框”挂到同段第一张图片上
+            # 这种情况用于段落中的"独立文本框"挂到同段第一张图片上
             if hasattr(textbox_elem, 'tag') and textbox_elem.tag == DocxUtils.W_NS + 'drawing' and drawing_elem is not None and textbox_elem is not drawing_elem:
                 try:
                     base_x, base_y = self._get_anchor_offsets(drawing_elem)
@@ -2089,7 +2314,7 @@ class DocxToHTMLConverter:
     
     def _get_list_prefix_html(self, paragraph):
         """获取列表前缀HTML（序号或项目符号）"""
-        list_info, level, list_id, list_color, numFmt, bullet_size = self.parse_list_from_xml(paragraph)
+        list_info, level, list_id, list_color, numFmt, bullet_size, bullet_font_family = self.parse_list_from_xml(paragraph)
         
         if not list_info:
             return ""
@@ -2129,12 +2354,17 @@ class DocxToHTMLConverter:
                 prefix_html = f'<span style="{number_style_str}">{number}.</span><span style="display:inline-block; width:{hanging_width}px;"></span>'
         elif list_info == 'bulleted':
             # 项目符号
-            bullet_char = list_id if list_id else '•'
+            bullet_char = list_id if list_id else None
             bullet_styles = []
             if list_color:
                 bullet_styles.append(f'color: {list_color}')
             else:
                 bullet_styles.append('color: inherit')
+            
+            # 字体
+            if bullet_font_family:
+                bullet_styles.append(f"font-family: '{bullet_font_family}'")
+            
             # 加粗依据XML
             try:
                 rPr0 = paragraph.runs[0]._element.rPr if paragraph.runs else None
@@ -2172,7 +2402,7 @@ class DocxToHTMLConverter:
             
         return prefix_html
 
-    def process_paragraph(self, paragraph, paragraph_index=None, table_context=None):
+    def process_paragraph(self, paragraph, paragraph_index=None, table_context=None, render_container=True, in_mixed_group=False):
         """处理段落 - 基于XML解析"""
         # 只记录简要日志，减少I/O
         if paragraph_index and paragraph_index % 100 == 0:
@@ -2201,16 +2431,59 @@ class DocxToHTMLConverter:
                     has_float = True
                     break
             
-            if has_float and has_text_content:
-                prefix_html = self._get_list_prefix_html(paragraph)
-                html += f'<p style="{base_style}">{prefix_html}{text_content}</p>'
-                has_text_content = False 
-
-            if has_float:
+            # 只有在非混排组的情况下，才给容器添加 overflow: hidden
+            # 混排组需要允许内部浮动元素溢出容器，以便与后续元素产生环绕效果
+            if has_float and not in_mixed_group:
                 container_style += "; overflow: hidden;"
             
-            html += f'<div style="{container_style}">'
+            # 特殊修正：在混排布局中，如果段落仅包含浮动文本框（可能包含已合并的文本），
+            # 且该文本框已有浮动样式，则不需要外层容器，以免影响布局（如双重浮动或宽度限制）
+            if in_mixed_group and len(images) == 1 and images[0].get('type') == 'textbox' and has_float:
+                render_container = False
+
+            # 根据 render_container 参数决定是否渲染外层容器
+            if render_container:
+                if container_style:
+                    html += f'<div style="{container_style}">'
+                else:
+                    html += '<div>'
             
+            # 在混排模式下，如果用户期望文本在前图片在后（如预期HTML所示），
+            # 且图片是右浮动，我们可以尝试调整顺序。
+            # 但标准浮动通常要求浮动元素在前。
+            # 这里我们保持图片在前，但根据用户反馈，我们先渲染图片。
+            
+            # 获取列表前缀（如果有）
+            prefix_html = ""
+            if has_text_content:
+                prefix_html = self._get_list_prefix_html(paragraph)
+
+            # 特殊处理：如果是在混排组中，且只有一个文本框，且有段落文本，
+            # 那么这段文本很可能是属于这个文本框的说明文字，应该将其合并到文本框内部显示。
+            if in_mixed_group and len(images) == 1 and images[0].get('type') == 'textbox' and has_text_content:
+                # 构造文本HTML
+                if base_style:
+                    text_html = f'<p style="{base_style}">{prefix_html}{text_content}</p>'
+                else:
+                    text_html = f'<p>{prefix_html}{text_content}</p>'
+                # 合并到文本框HTML最前面
+                images[0]['html'] = text_html + images[0].get('html', '')
+                self.log_file.write(f"  [Mixed Layout] 将段落文本合并入文本框: {text_content[:20]}...\n")
+                has_text_content = False
+            
+            # 在混排模式下，如果有剩余文本，且用户期望文本在前（如预期HTML所示），先渲染文本
+            if in_mixed_group and has_text_content:
+                 if base_style:
+                     html += f'<p style="{base_style}">{prefix_html}{text_content}</p>'
+                 else:
+                     html += f'<p>{prefix_html}{text_content}</p>'
+                 has_text_content = False
+
+            # 获取段落左缩进，用于修正 Group 容器位置
+            indent_left_px = 0
+            if paragraph.paragraph_format.left_indent:
+                indent_left_px = int(DocxUtils.twip_to_pixels(paragraph.paragraph_format.left_indent.twips))
+
             # 处理图片
             for i, img in enumerate(images):
                 if img.get('type') == 'textbox':
@@ -2236,7 +2509,10 @@ class DocxToHTMLConverter:
                     tb_html = img.get('html', '')
                     
                     self.log_file.write(f"  生成独立文本框: style={tb_style_str}\n")
-                    html += f'<div style="{tb_style_str}">{tb_html}</div>'
+                    if tb_style_str:
+                        html += f'<div style="{tb_style_str}">{tb_html}</div>'
+                    else:
+                        html += f'<div>{tb_html}</div>'
 
                 elif img.get('type') == 'group':
                     # 处理组合容器
@@ -2249,10 +2525,36 @@ class DocxToHTMLConverter:
                     if img.get('wrap_style'):
                         group_styles.append(img['wrap_style'])
                     
+                    # 修正 Group 容器的 margin-left
+                    # 容器被放置在有缩进(indent_left_px)的段落div中
+                    # 但Group内容的 min_x 是相对于 column 左边缘的
+                    # 为了让 Group 的 left=0 (即 min_x) 对应正确的视觉位置
+                    # 我们需要将 Group 容器反向移动，或者调整其 margin-left
+                    # Group div 的视觉左边缘应该是 min_x
+                    # 当前视觉左边缘是 indent_left_px (因为父级 padding/margin)
+                    # 所以需要 shift: min_x - indent_left_px
+                    if 'min_x' in img:
+                        min_x = img['min_x']
+                        margin_correction = min_x - indent_left_px
+                        # 只有当偏差显著时才调整 (>1px)
+                        if abs(margin_correction) > 1:
+                            group_styles.append(f'margin-left: {int(margin_correction)}px')
+                            self.log_file.write(f"  [Group Layout] 修正容器 margin-left: {int(margin_correction)}px (min_x={min_x}, indent={indent_left_px})\n")
+                    
+                    if 'min_y' in img:
+                        min_y = img['min_y']
+                        # 只有当垂直偏移显著时才调整 (>1px)
+                        if min_y > 1:
+                            group_styles.append(f'margin-top: {int(min_y)}px')
+                            self.log_file.write(f"  [Group Layout] 修正容器 margin-top: {int(min_y)}px\n")
+                    
                     group_styles.append('position: relative')
                     group_style_str = '; '.join(group_styles)
                     
-                    html += f'<div style="{group_style_str}">'
+                    if group_style_str:
+                        html += f'<div style="{group_style_str}">'
+                    else:
+                        html += '<div>'
                     
                     # 渲染叠加层
                     for ov in img.get('overlays', []):
@@ -2271,13 +2573,22 @@ class DocxToHTMLConverter:
                         
                         if ov.get('type') == 'image' and ov.get('filename'):
                             oimg_path = f'./images/{ov["filename"]}'
-                            html += f'<img src="{oimg_path}" style="{ov_style_str}" alt="{ov["filename"]}" />'
+                            if ov_style_str:
+                                html += f'<img src="{oimg_path}" style="{ov_style_str}" alt="{ov["filename"]}" />'
+                            else:
+                                html += f'<img src="{oimg_path}" alt="{ov["filename"]}" />'
                         else:
                             if ov.get('html'):
-                                html += f'<div style="{ov_style_str}">{ov["html"]}</div>'
+                                if ov_style_str:
+                                    html += f'<div style="{ov_style_str}">{ov["html"]}</div>'
+                                else:
+                                    html += f'<div>{ov["html"]}</div>'
                             else:
                                 escaped_text = escape(ov.get('text', ''))
-                                html += f'<div style="{ov_style_str}">{escaped_text}</div>'
+                                if ov_style_str:
+                                    html += f'<div style="{ov_style_str}">{escaped_text}</div>'
+                                else:
+                                    html += f'<div>{escaped_text}</div>'
                     
                     html += '</div>'
 
@@ -2314,8 +2625,14 @@ class DocxToHTMLConverter:
                         bg_img_style.append('z-index: 0')
                         img_style_str = '; '.join(bg_img_style)
                         img_path = f"./images/{img['filename']}"
-                        html += f'<div style="{container_str}">'
-                        html += f'<img src="{img_path}" style="{img_style_str}" alt="{img["filename"]}" />'
+                        if container_str:
+                            html += f'<div style="{container_str}">'
+                        else:
+                            html += '<div>'
+                        if img_style_str:
+                            html += f'<img src="{img_path}" style="{img_style_str}" alt="{img["filename"]}" />'
+                        else:
+                            html += f'<img src="{img_path}" alt="{img["filename"]}" />'
                         # 叠加层
                         for ov in img['overlays']:
                             ov_styles = ['position: absolute', 'z-index: 1']
@@ -2330,27 +2647,42 @@ class DocxToHTMLConverter:
                             ov_style_str = '; '.join(ov_styles)
                             if ov.get('type') == 'image' and ov.get('filename'):
                                 oimg_path = f'./images/{ov["filename"]}'
-                                html += f'<img src="{oimg_path}" style="{ov_style_str}" alt="{ov["filename"]}" />'
+                                if ov_style_str:
+                                    html += f'<img src="{oimg_path}" style="{ov_style_str}" alt="{ov["filename"]}" />'
+                                else:
+                                    html += f'<img src="{oimg_path}" alt="{ov["filename"]}" />'
                             else:
                                 if ov.get('html'):
-                                    html += f'<div style="{ov_style_str}">{ov["html"]}</div>'
+                                    if ov_style_str:
+                                        html += f'<div style="{ov_style_str}">{ov["html"]}</div>'
+                                    else:
+                                        html += f'<div>{ov["html"]}</div>'
                                 else:
                                     escaped_text = escape(ov.get('text', ''))
-                                    html += f'<div style="{ov_style_str}">{escaped_text}</div>'
+                                    if ov_style_str:
+                                        html += f'<div style="{ov_style_str}">{escaped_text}</div>'
+                                    else:
+                                        html += f'<div>{escaped_text}</div>'
                         html += '</div>'
                     else:
                         img_style_str = '; '.join(img_style)
                         img_path = f"./images/{img['filename']}"
                         self.log_file.write(f"  生成图片标签: src={img_path}, style={img_style_str}\n")
-                        html += f'<img src="{img_path}" style="{img_style_str}" alt="{img["filename"]}" />'
+                        if img_style_str:
+                            html += f'<img src="{img_path}" style="{img_style_str}" alt="{img["filename"]}" />'
+                        else:
+                            html += f'<img src="{img_path}" alt="{img["filename"]}" />'
             
             # 添加段落文本（如果有）
             if has_text_content:
-                # 尝试获取列表前缀
-                prefix_html = self._get_list_prefix_html(paragraph)
-                html += f'<div>{prefix_html}{text_content}</div>'
+                # prefix_html 已在前面计算
+                if base_style:
+                    html += f'<p style="{base_style}">{prefix_html}{text_content}</p>'
+                else:
+                    html += f'<p>{prefix_html}{text_content}</p>'
             
-            html += '</div>'
+            if render_container:
+                html += '</div>'
             
         elif not paragraph.text.strip():
             # 空段落
@@ -2364,7 +2696,7 @@ class DocxToHTMLConverter:
                 text = self.extract_paragraph_text_with_links(paragraph)
                 
                 # 如果标题段落存在自动编号/项目符号，补充前缀
-                list_info, level, list_id, list_color, numFmt, bullet_size = self.parse_list_from_xml(paragraph)
+                list_info, level, list_id, list_color, numFmt, bullet_size, bullet_font_family = self.parse_list_from_xml(paragraph)
                 prefix_html = ""
                 if list_info == 'numbered':
                     number = self._get_list_number(list_id, level, numFmt)
@@ -2396,12 +2728,16 @@ class DocxToHTMLConverter:
                         number_style_str = '; '.join(number_style)
                         prefix_html = f'<span style="{number_style_str}">{number}.</span><span style="display:inline-block; width:{hanging_width}px;"></span>'
                 elif list_info == 'bulleted':
-                    bullet_char = list_id if list_id else '•'
+                    bullet_char = list_id if list_id else None
                     bullet_styles = []
                     if list_color:
                         bullet_styles.append(f'color: {list_color}')
                     else:
                         bullet_styles.append('color: inherit')
+                    
+                    if bullet_font_family:
+                        bullet_styles.append(f"font-family: '{bullet_font_family}'")
+
                     try:
                         rPr0 = paragraph.runs[0]._element.rPr if paragraph.runs else None
                         if rPr0 is not None:
@@ -2442,7 +2778,10 @@ class DocxToHTMLConverter:
                 heading_text_clean = DocxUtils.strip_html_tags(text).strip()
                 self.headings_map[heading_text_clean] = heading_id
                 
-                html = f'<p id="{heading_id}" style="{style}">{prefix_html}{text}</p>'
+                if style:
+                    html = f'<p id="{heading_id}" style="{style}">{prefix_html}{text}</p>'
+                else:
+                    html = f'<p id="{heading_id}">{prefix_html}{text}</p>'
                 self.log_file.write(f"标题: {heading_text_clean[:30]}... -> #{heading_id}\n")
             
             else:
@@ -2472,10 +2811,16 @@ class DocxToHTMLConverter:
                             style = border_style
 
                     if heading_id and self._paragraph_has_hyperlink(paragraph):
-                        html = f'<p style="{style}"><a href="#{heading_id}" style="{DocxUtils.normalize_css("")}">{toc_title}</a></p>'
+                        if style:
+                            html = f'<p style="{style}"><a href="#{heading_id}" style="{DocxUtils.normalize_css("")}">{toc_title}</a></p>'
+                        else:
+                            html = f'<p><a href="#{heading_id}" style="{DocxUtils.normalize_css("")}">{toc_title}</a></p>'
                         self.log_file.write(f"目录链接: {toc_title} -> #{heading_id}\n")
                     else:
-                        html = f'<p style="{style}">{toc_title}</p>'
+                        if style:
+                            html = f'<p style="{style}">{toc_title}</p>'
+                        else:
+                            html = f'<p>{toc_title}</p>'
                         self.log_file.write(f"目录标题未匹配或原文无超链接: {toc_title}\n")
                     
                 else:
@@ -2487,7 +2832,7 @@ class DocxToHTMLConverter:
                             style = self._get_paragraph_format_from_xml(paragraph)
                             text = self.extract_paragraph_text_with_links(paragraph)
                             # 标题前缀（若存在）
-                            list_info, level, list_id, list_color, numFmt, bullet_size = self.parse_list_from_xml(paragraph)
+                            list_info, level, list_id, list_color, numFmt, bullet_size, bullet_font_family = self.parse_list_from_xml(paragraph)
                             prefix_html = ""
                             if list_info == 'numbered':
                                 number = self._get_list_number(list_id, level, numFmt)
@@ -2518,12 +2863,16 @@ class DocxToHTMLConverter:
                                     number_style_str = '; '.join(number_style)
                                     prefix_html = f'<span style="{number_style_str}">{number}.</span><span style="display:inline-block; width:{hanging_width}px;"></span>'
                             elif list_info == 'bulleted':
-                                bullet_char = list_id if list_id else '•'
+                                bullet_char = list_id if list_id else None
                                 bullet_styles = []
                                 if list_color:
                                     bullet_styles.append(f'color: {list_color}')
                                 else:
                                     bullet_styles.append('color: inherit')
+                                
+                                if bullet_font_family:
+                                    bullet_styles.append(f"font-family: '{bullet_font_family}'")
+
                                 try:
                                     rPr0 = paragraph.runs[0]._element.rPr if paragraph.runs else None
                                     if rPr0 is not None:
@@ -2561,14 +2910,17 @@ class DocxToHTMLConverter:
                                 
                             heading_text_clean = DocxUtils.strip_html_tags(text).strip()
                             self.headings_map[heading_text_clean] = heading_id
-                            html = f'<p id="{heading_id}" style="{style}">{prefix_html}{text}</p>'
+                            if style:
+                                html = f'<p id="{heading_id}" style="{style}">{prefix_html}{text}</p>'
+                            else:
+                                html = f'<p id="{heading_id}">{prefix_html}{text}</p>'
                             self.log_file.write(f"目录辅助识别标题: {heading_text_clean[:30]}... -> #{heading_id}\n")
                             return html
                     except Exception:
                         pass
                     
                     # 检查列表
-                    list_info, level, list_id, list_color, numFmt, bullet_size = self.parse_list_from_xml(paragraph)
+                    list_info, level, list_id, list_color, numFmt, bullet_size, bullet_font_family = self.parse_list_from_xml(paragraph)
                     
                     if list_info:
                         # 列表段落
@@ -2606,17 +2958,27 @@ class DocxToHTMLConverter:
                                                 hanging_width = max(15, left_px // 3)
                                 
                                 number_style_str = '; '.join(number_style)
-                                html = f'<p style="{style}"><span style="{number_style_str}">{number}.</span><span style="display:inline-block; width:{hanging_width}px;"></span><span>{full_text}</span></p>'
+                                if style:
+                                    html = f'<p style="{style}"><span style="{number_style_str}">{number}.</span><span style="display:inline-block; width:{hanging_width}px;"></span><span>{full_text}</span></p>'
+                                else:
+                                    html = f'<p><span style="{number_style_str}">{number}.</span><span style="display:inline-block; width:{hanging_width}px;"></span><span>{full_text}</span></p>'
                             else:
-                                html = f'<p style="{style}">{full_text}</p>'
+                                if style:
+                                    html = f'<p style="{style}">{full_text}</p>'
+                                else:
+                                    html = f'<p>{full_text}</p>'
                         else:
                             # 项目符号
-                            bullet_char = list_id if list_id else '•'
+                            bullet_char = list_id if list_id else None
                             bullet_styles = []
                             if list_color:
                                 bullet_styles.append(f'color: {list_color}')
                             else:
                                 bullet_styles.append('color: inherit')
+                            
+                            if bullet_font_family:
+                                bullet_styles.append(f"font-family: '{bullet_font_family}'")
+
                             # 加粗依据XML
                             try:
                                 rPr0 = paragraph.runs[0]._element.rPr if paragraph.runs else None
@@ -2650,13 +3012,19 @@ class DocxToHTMLConverter:
                                             hanging_width = max(15, left_px // 3)  # 左缩进的1/3作为项目符号间隔
 
                             bullet_style = '; '.join(bullet_styles)
-                            html = f'<p style="{style}"><span style="{bullet_style}">{bullet_char}</span><span style="display:inline-block; width:{hanging_width}px;"></span>{full_text}</p>'
+                            if style:
+                                html = f'<p style="{style}"><span style="{bullet_style}">{bullet_char}</span><span style="display:inline-block; width:{hanging_width}px;"></span>{full_text}</p>'
+                            else:
+                                html = f'<p><span style="{bullet_style}">{bullet_char}</span><span style="display:inline-block; width:{hanging_width}px;"></span>{full_text}</p>'
                         
                     else:
                         # 普通段落
                         style = self._get_paragraph_format_from_xml(paragraph)
                         text = self.extract_paragraph_text_with_links(paragraph)
-                        html = f'<p style="{style}">{text}</p>'
+                        if style:
+                            html = f'<p style="{style}">{text}</p>'
+                        else:
+                            html = f'<p>{text}</p>'
         
         return html
     
@@ -2775,7 +3143,27 @@ class DocxToHTMLConverter:
                             self.log_file.write(f"        Blip {blip_idx}: 无embed属性\n")
         
         self.log_file.write(f"  段落图片提取完成，共 {len(images)} 个图片\n")
-        
+
+        indent_px = 0
+        try:
+            pf = paragraph.paragraph_format
+            left_indent = pf.left_indent
+            first_line_indent = pf.first_line_indent
+            
+            indent_val = 0
+            if left_indent:
+                indent_val += left_indent.twips
+            
+            if first_line_indent:
+                indent_val += first_line_indent.twips
+                
+            if indent_val:
+                indent_px = int(DocxUtils.twip_to_pixels(indent_val, apply_scale=True))
+                self.log_file.write(f"  段落缩进(含样式): {indent_px}px (val={indent_val})\n")
+                
+        except Exception as e:
+            self.log_file.write(f"  计算缩进失败: {e}\n")
+
         # 合并所有图片和文本框，进行智能分组
         all_items = []
         # 添加图片
@@ -2826,6 +3214,16 @@ class DocxToHTMLConverter:
         for it in all_items:
             elem = it.get('drawing_elem')
             x, y = self._get_anchor_offsets(elem)
+            
+            # Special handling for inline images (wp:inline) which return 0,0 from _get_anchor_offsets
+            # We apply paragraph indentation to X
+            if x == 0 and y == 0:
+                is_inline = elem.find(f'.//{DocxUtils.WP_NS}inline') is not None
+                if is_inline:
+                    self.log_file.write(f"  [Inline Image] 应用缩进修正: x={indent_px}\n")
+                    x = indent_px
+                    # y remains 0 (relative to paragraph start)
+
             it['_abs_x'] = x
             it['_abs_y'] = y
             it['_rect'] = (x, y, it.get('width', 0) or 0, it.get('height', 0) or 0)
@@ -2933,6 +3331,8 @@ class DocxToHTMLConverter:
                 
                 container = {
                     'type': 'group',
+                    'min_x': min_x,
+                    'min_y': min_y,
                     'width': container_w,
                     'height': container_h,
                     'overlays': [],
@@ -2972,14 +3372,35 @@ class DocxToHTMLConverter:
             if anchor is not None:
                 positionH = anchor.find(f'.//{DocxUtils.WP_NS}positionH')
                 if positionH is not None:
+                    relative_from = positionH.get('relativeFrom')
                     posOffset = positionH.find(f'.//{DocxUtils.WP_NS}posOffset')
                     if posOffset is not None and posOffset.text:
-                        x_px = DocxUtils.emu_to_pixels(int(posOffset.text), apply_scale=True)
+                        val_px = DocxUtils.emu_to_pixels(int(posOffset.text), apply_scale=True)
+                        # 如果是相对于页面的，需要减去左边距，转换为相对于内容区（margin）的坐标
+                        if relative_from == 'page':
+                            margin_px = DocxUtils.emu_to_pixels(self.page_left_margin, apply_scale=True)
+                            self.log_file.write(f"DEBUG: X relative_from=page, val_px={val_px}, margin={margin_px}\n")
+                            x_px = val_px - margin_px
+                        else:
+                            # 默认为 margin, column, character 等，视为相对于内容区起始点
+                            self.log_file.write(f"DEBUG: X relative_from={relative_from}, val_px={val_px}\n")
+                            x_px = val_px
+                            
                 positionV = anchor.find(f'.//{DocxUtils.WP_NS}positionV')
                 if positionV is not None:
+                    relative_from = positionV.get('relativeFrom')
                     posOffset = positionV.find(f'.//{DocxUtils.WP_NS}posOffset')
                     if posOffset is not None and posOffset.text:
-                        y_px = DocxUtils.emu_to_pixels(int(posOffset.text), apply_scale=True)
+                        val_px = DocxUtils.emu_to_pixels(int(posOffset.text), apply_scale=True)
+                        # 如果是相对于页面的，需要减去上边距
+                        if relative_from == 'page':
+                            margin_px = DocxUtils.emu_to_pixels(self.page_top_margin, apply_scale=True)
+                            self.log_file.write(f"DEBUG: Y relative_from=page, val_px={val_px}, margin={margin_px}\n")
+                            y_px = val_px - margin_px
+                        else:
+                            # 默认为 margin, paragraph, line 等
+                            self.log_file.write(f"DEBUG: Y relative_from={relative_from}, val_px={val_px}\n")
+                            y_px = val_px
         except Exception:
             pass
         return x_px, y_px
@@ -3079,7 +3500,10 @@ class DocxToHTMLConverter:
         table_container_style_str = '; '.join(table_container_style)
         
         html = f'<div>'
-        html += f'<table style="{table_style_str}">'
+        if table_style_str:
+            html += f'<table style="{table_style_str}">'
+        else:
+            html += '<table>'
         
         skip_cells = set()
         rows = list(table.rows)
@@ -3161,7 +3585,10 @@ class DocxToHTMLConverter:
                     span_attrs += f' colspan="{colspan}"'
                 if rowspan > 1:
                     span_attrs += f' rowspan="{rowspan}"'
-                html += f'<td{span_attrs} style="{cell_style_str}">'
+                if cell_style_str:
+                    html += f'<td{span_attrs} style="{cell_style_str}">'
+                else:
+                    html += f'<td{span_attrs}>'
                 for para in cell.paragraphs:
                     html += self.process_paragraph(para, f"{table_index}-R{r_i+1}C{c_i+1}")
                 html += '</td>'

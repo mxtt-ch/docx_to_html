@@ -248,16 +248,6 @@ class DocxUtils:
         if rPr is None:
             return ""
         
-        # 字体大小（half-point单位）
-        sz = rPr.find(qn('w:sz'))
-        if sz is not None:
-            sz_val = sz.get(qn('w:val'))
-            if sz_val:
-                font_size_pt = int(sz_val) / 2
-                base_px = font_size_pt * 1.33
-                font_size_px = int(base_px * (DocxUtils.SCALE if apply_scale else 1.0))
-                styles.append(f'font-size: {font_size_px}px')
-        
         # 颜色
         color = rPr.find(qn('w:color'))
         if color is not None:
@@ -309,17 +299,6 @@ class DocxUtils:
         strike = rPr.find(qn('w:strike'))
         if strike is not None and strike.get(qn('w:val')) != '0':
             styles.append('text-decoration: line-through')
-        
-        # 字体族（支持回退链）
-        rFonts = rPr.find(qn('w:rFonts'))
-        if rFonts is not None:
-            fonts = []
-            for attr in ['ascii', 'hAnsi', 'eastAsia', 'cs']:
-                font_val = rFonts.get(qn(f'w:{attr}'))
-                if font_val:
-                    fonts.append(f"'{font_val}'")
-            if fonts:
-                styles.append(f"font-family: {', '.join(fonts)}, sans-serif")
         
         # 上下标
         vertAlign = rPr.find(qn('w:vertAlign'))
